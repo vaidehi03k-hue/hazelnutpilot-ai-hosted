@@ -8,7 +8,7 @@ export async function runWebTests(projectId, tests, { db } = {}){
   const outDir = path.join(process.cwd(), 'runs', projectId + '-' + Date.now())
   fs.mkdirSync(outDir, { recursive: true })
   let pass = 0, fail = 0
-  const browser = await chromium.launch({ headless: true })
+  const browser = await chromium.launch({ headless: true,args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu'], })
   const context = await browser.newContext()
   const page = await context.newPage()
   for (const t of (tests||[])){
