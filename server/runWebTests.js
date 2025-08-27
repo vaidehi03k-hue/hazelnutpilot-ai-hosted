@@ -1,30 +1,24 @@
+// server/runWebTests.js
 import fs from 'fs';
 import path from 'path';
 import { chromium } from 'playwright';
 
-// --------- utils ----------
+const STEP_TIMEOUT = 8000;     // per action max
+const FIND_RETRIES = 2;        // retry element resolution
+const RETRY_DELAY = 300;       // ms between retries
+
 function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); }
+
 function normalizeUrl(url) {
   if (!url) return '';
   const u = url.trim();
   if (/^https?:\/\//i.test(u)) return u;
+  // handle "www.something" or "/foo"
+  if (/^www\./i.test(u)) return 'https://' + u;
   return 'https://' + u.replace(/^\/+/, '');
 }
 
-// --------- step parsing (generic; no login assumptions) ----------
-/*
-  Supported patterns (examples, case-insensitive):
-  - Go to https://example.com
-  - Navigate to www.example.com/page
-  - Click "Add to Cart"
-  - Click the checkout button
-  - Enter "Vaidehi" into name field
-  - Fill email with "me@example.com"
-  - Type "qwerty" in search
-  - Expect to see "Order Placed"
-  - Verify text "Welcome"
-  - URL contains "/inventory"
-*/
+/** Parse generic steps (no login assumptions) */
 function parseStep(raw) {
   const step = typeof raw === 'string' ? raw : (raw?.step || '');
   const expect = typeof raw === 'object' ? (raw?.expect || '') : '';
@@ -35,23 +29,20 @@ function parseStep(raw) {
   const goto = low.match(/\b(go to|navigate to|open)\b\s+([^\s"']+)/);
   if (goto) return { type: 'goto', url: normalizeUrl(goto[2]), raw: step, expect };
 
-  // fill: value "..." + target hint (optional)
+  // fill
   if (/\b(fill|type|enter)\b/.test(low)) {
     const value = (s.match(/"(.*?)"/) || [])[1] ?? '';
-    // try to extract a hint phrase (e.g., "into name field", "in search", "into the company input")
     const hint =
       (low.match(/\b(into|in|on)\b\s+(the )?(.+?)(?: field| input| box| area)?$/)?.[3] || '')
-        .replace(/["']/g, '')
-        .trim();
+        .replace(/["']/g, '').trim();
     return { type: 'fill', value, hint, raw: step, expect };
   }
 
-  // click by quoted text or hint
+  // click
   if (/\b(click|press|tap)\b/.test(low)) {
     const quoted = (s.match(/"([^"]+)"/) || [])[1];
     const hint = quoted || (low.match(/\b(click|press|tap)\b\s+(the )?(.+)$/)?.[3] || '')
-      .replace(/\b(button|link|cta|icon)\b/g, '')
-      .trim();
+      .replace(/\b(button|link|cta|icon)\b/g, '').trim();
     return { type: 'click', hint, raw: step, expect };
   }
 
@@ -59,126 +50,108 @@ function parseStep(raw) {
   const urlc = low.match(/url (contains|has)\s+"?([^"]+)"?/);
   if (urlc) return { type: 'expectUrlContains', frag: urlc[2], raw: step, expect };
 
-  // see / verify text "..."
-  const quotedText = (s.match(/"([^"]+)"/) || [])[1];
-  if ((/\b(see|verify|expect)\b/.test(low) || expect) && (quotedText || expect)) {
-    return { type: 'expectText', text: quotedText || expect, raw: step, expect };
+  // expect text
+  const quotedText = (s.match(/"([^"]+)"/) || [])[1] || expect;
+  if ((/\b(see|verify|expect)\b/.test(low) || expect) && quotedText) {
+    return { type: 'expectText', text: quotedText, raw: step, expect };
   }
 
   return { type: 'noop', raw: step, expect };
 }
 
-// --------- dynamic selector resolution ----------
-async function candidatesForFill(page, hint) {
-  const cands = [];
+function cssEscape(s) { return String(s).replace(/(["\\])/g, '\\$1'); }
 
-  // 1) By label / placeholder (best)
-  if (hint) {
-    cands.push({ how: 'getByLabel', locator: page.getByLabel(hint, { exact: false }).first() });
-    cands.push({ how: 'getByPlaceholder', locator: page.getByPlaceholder(hint, { exact: false }).first() });
+async function filterExisting(cands) {
+  const out = [];
+  for (const c of cands) {
+    try { if (await c.locator.count()) out.push(c); } catch {}
   }
+  return out;
+}
 
-  // 2) Generic text inputs
-  cands.push({ how: 'textInputs', locator: page.locator('input:not([type]),input[type="text"],textarea').first() });
-
-  // 3) Fuzzy attributes by hint
+async function candidatesForFill(page, hint) {
+  const c = [];
   if (hint) {
-    const css = [
+    c.push({ how: 'getByLabel',       locator: page.getByLabel(hint, { exact: false }).first() });
+    c.push({ how: 'getByPlaceholder', locator: page.getByPlaceholder(hint, { exact: false }).first() });
+  }
+  c.push({ how: 'textInputs', locator: page.locator('input:not([type]),input[type="text"],textarea').first() });
+  if (hint) {
+    const fuzzy = [
       `input[name*="${cssEscape(hint)}" i]`,
       `input[id*="${cssEscape(hint)}" i]`,
       `[aria-label*="${cssEscape(hint)}" i]`,
       `[data-test*="${cssEscape(hint)}" i]`,
       `[data-qa*="${cssEscape(hint)}" i]`
     ].join(',');
-    cands.push({ how: 'fuzzyAttrs', locator: page.locator(css).first() });
+    c.push({ how: 'fuzzyAttr', locator: page.locator(fuzzy).first() });
   }
-
-  return filterExisting(page, cands);
+  return filterExisting(c);
 }
 
 async function candidatesForClick(page, hint) {
-  const cands = [];
-
+  const c = [];
   if (hint) {
-    cands.push({ how: 'role=button(name)', locator: page.getByRole('button', { name: hint, exact: false }).first() });
-    cands.push({ how: 'role=link(name)',   locator: page.getByRole('link',   { name: hint, exact: false }).first() });
-    cands.push({ how: 'text on clickable', locator: page.locator(`button:has-text("${cssEscape(hint)}"),a:has-text("${cssEscape(hint)}"),[role=button]:has-text("${cssEscape(hint)}")`).first() });
+    c.push({ how: 'role=button(name)', locator: page.getByRole('button', { name: hint, exact: false }).first() });
+    c.push({ how: 'role=link(name)',   locator: page.getByRole('link',   { name: hint, exact: false }).first() });
+    c.push({ how: 'clickableText',     locator: page.locator(`button:has-text("${cssEscape(hint)}"),a:has-text("${cssEscape(hint)}"),[role=button]:has-text("${cssEscape(hint)}")`).first() });
   }
-
-  // Generic primary actions
-  cands.push({ how: 'submit-ish', locator: page.locator('button[type=submit],input[type=submit]').first() });
-  cands.push({ how: 'any button', locator: page.locator('button,[role=button]').first() });
-
-  return filterExisting(page, cands);
+  c.push({ how: 'submit-ish', locator: page.locator('button[type=submit],input[type=submit]').first() });
+  c.push({ how: 'any button', locator: page.locator('button,[role=button]').first() });
+  return filterExisting(c);
 }
 
-async function filterExisting(page, arr) {
-  const out = [];
-  for (const c of arr) {
-    try { if (await c.locator.count()) out.push(c); } catch {}
-  }
-  return out;
-}
-
-function cssEscape(s) {
-  return String(s).replace(/["\\]/g, '\\$&');
-}
-
-// --------- AI tie-breaker (optional) ----------
+/** Optional AI tie-breaker to pick among candidates (only if env enabled) */
 async function aiPick({ stepText, context, candidates }) {
   if (!process.env.USE_AI_TIEBREAKER) return null;
   const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) return null;
-
+  if (!apiKey || candidates.length === 0) return null;
   const model = process.env.OPENROUTER_MODEL || 'google/gemma-3-27b-it:free';
 
-  // Build a compact prompt: send innerText + attributes for each candidate
   const candSummaries = await Promise.all(candidates.map(async (c, i) => {
-    const el = c.locator;
-    const info = await el.evaluate((node) => {
+    const info = await c.locator.evaluate((node) => {
       const attrs = {};
-      for (const a of (node.getAttributeNames?.() || [])) attrs[a] = node.getAttribute(a);
-      return {
-        tag: node.tagName?.toLowerCase?.() || 'node',
-        attrs,
-        text: (node.innerText || '').trim().slice(0, 200),
-      };
+      if (node.getAttributeNames) for (const a of node.getAttributeNames()) attrs[a] = node.getAttribute(a);
+      return { tag: node.tagName?.toLowerCase?.() || 'node', attrs, text: (node.innerText || '').trim().slice(0, 120) };
     }).catch(() => ({ tag:'node', attrs:{}, text:'' }));
     return `#${i+1} [${c.how}] <${info.tag} ${Object.entries(info.attrs).map(([k,v])=>`${k}="${v}"`).join(' ')}> text="${info.text}"`;
   }));
 
-  const prompt = `You are helping map a PRD step to the correct DOM element.
-Page context: ${context}
+  const prompt = `Pick the correct DOM target for this step.
 Step: "${stepText}"
+Context: ${context}
 Candidates:
 ${candSummaries.join('\n')}
-Pick the single best candidate by number only (e.g., "2"). If none match, reply "none".`;
+Reply with just the number (e.g., "2"), or "none".`;
 
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type':'application/json' },
-    body: JSON.stringify({
-      model,
-      temperature: 0.0,
-      messages: [{ role:'user', content: prompt }]
-    })
+    body: JSON.stringify({ model, temperature: 0, messages: [{ role:'user', content: prompt }] })
   }).catch(()=>null);
   if (!res || !res.ok) return null;
   const j = await res.json().catch(()=>null);
   const raw = j?.choices?.[0]?.message?.content || '';
   const m = raw.match(/\b(\d+)\b/);
-  if (!m) return null;
-  const idx = Number(m[1]) - 1;
-  if (idx < 0 || idx >= candidates.length) return null;
-  return candidates[idx];
+  const idx = m ? Number(m[1]) - 1 : -1;
+  return (idx >= 0 && idx < candidates.length) ? candidates[idx] : null;
 }
 
-// --------- main runner ----------
+async function withRetries(fn, tries = FIND_RETRIES) {
+  let last;
+  for (let i=0;i<tries;i++) {
+    try { return await fn(); } catch (e) { last = e; await new Promise(r=>setTimeout(r, RETRY_DELAY)); }
+  }
+  throw last || new Error('retry exceeded');
+}
+
 export async function runWebTests({ steps, baseUrl, runId }) {
   const runsRoot = path.join(process.cwd(), 'runs');
   const runDir   = path.join(runsRoot, runId || Date.now().toString());
   const shotsDir = path.join(runDir, 'screenshots');
   ensureDir(shotsDir);
+  const logPath  = path.join(runDir, 'run.log');
+  const log = (line) => fs.appendFileSync(logPath, line + '\n');
 
   const browser = await chromium.launch({
     headless: true,
@@ -190,12 +163,14 @@ export async function runWebTests({ steps, baseUrl, runId }) {
     recordVideo: { dir: runDir, size: { width: 1280, height: 800 } },
     viewport: { width: 1280, height: 800 },
   });
-
   const page = await context.newPage();
 
-  // Go to base URL first (if provided)
+  // go to base URL first (if given)
   const startUrl = normalizeUrl(baseUrl);
-  if (startUrl) await page.goto(startUrl, { waitUntil: 'domcontentloaded' });
+  if (startUrl) {
+    await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: STEP_TIMEOUT });
+    await page.waitForLoadState('networkidle', { timeout: STEP_TIMEOUT }).catch(()=>{});
+  }
 
   const results = [];
   let idx = 0;
@@ -207,50 +182,47 @@ export async function runWebTests({ steps, baseUrl, runId }) {
 
     try {
       if (s.type === 'goto') {
-        await page.goto(s.url, { waitUntil: 'domcontentloaded' });
+        await page.goto(s.url, { waitUntil: 'domcontentloaded', timeout: STEP_TIMEOUT });
+        await page.waitForLoadState('networkidle', { timeout: STEP_TIMEOUT }).catch(()=>{});
       }
 
       else if (s.type === 'fill') {
-        let cands = await candidatesForFill(page, s.hint);
+        let cands = await withRetries(() => candidatesForFill(page, s.hint), FIND_RETRIES);
         let pick = cands[0] || null;
-
-        // If ambiguous or none, ask AI
-        if ((!pick || cands.length > 1)) {
-          const ai = await aiPick({
-            stepText: s.raw,
-            context: `url=${page.url()}`,
-            candidates: cands
-          });
+        if (!pick || cands.length > 1) {
+          const ai = await aiPick({ stepText: s.raw, context: `url=${page.url()}`, candidates: cands });
           if (ai) pick = ai;
         }
         if (!pick) throw new Error(`Field not found (hint="${s.hint||''}")`);
-        await pick.locator.fill(s.value ?? '');
+        await pick.locator.scrollIntoViewIfNeeded();
+        await pick.locator.fill(s.value ?? '', { timeout: STEP_TIMEOUT });
       }
 
       else if (s.type === 'click') {
-        let cands = await candidatesForClick(page, s.hint);
+        let cands = await withRetries(() => candidatesForClick(page, s.hint), FIND_RETRIES);
         let pick = cands[0] || null;
-
-        if ((!pick || cands.length > 1)) {
-          const ai = await aiPick({
-            stepText: s.raw,
-            context: `url=${page.url()}`,
-            candidates: cands
-          });
+        if (!pick || cands.length > 1) {
+          const ai = await aiPick({ stepText: s.raw, context: `url=${page.url()}`, candidates: cands });
           if (ai) pick = ai;
         }
         if (!pick) throw new Error(`Clickable not found (hint="${s.hint||''}")`);
-        await pick.locator.click();
+        await pick.locator.scrollIntoViewIfNeeded();
+        await pick.locator.click({ timeout: STEP_TIMEOUT });
+        // let page settle
+        await page.waitForLoadState('networkidle', { timeout: STEP_TIMEOUT }).catch(()=>{});
       }
 
       else if (s.type === 'expectUrlContains') {
-        const url = page.url();
-        if (!url.includes(s.frag)) throw new Error(`URL "${url}" does not include "${s.frag}"`);
+        await page.waitForFunction(
+          (frag) => location.href.includes(frag),
+          s.frag,
+          { timeout: STEP_TIMEOUT }
+        );
       }
 
       else if (s.type === 'expectText') {
         const loc = page.getByText(s.text, { exact: false }).first();
-        if (!(await loc.count())) throw new Error(`Text "${s.text}" not found`);
+        await loc.waitFor({ state: 'visible', timeout: STEP_TIMEOUT });
       }
 
       // else noop
@@ -258,11 +230,17 @@ export async function runWebTests({ steps, baseUrl, runId }) {
     } catch (e) {
       passed = false;
       error = String(e?.message || e);
+      // capture small HTML snippet for debugging
+      try {
+        const html = await page.evaluate(() => document.body?.innerText?.slice(0, 2000) || '');
+        log(`STEP ${idx} FAIL: ${s.raw}\nERR: ${error}\nURL: ${page.url()}\nSNIPPET:\n${html}\n---`);
+      } catch {
+        log(`STEP ${idx} FAIL: ${s.raw}\nERR: ${error}\nURL: ${page.url()}\n---`);
+      }
     }
 
     const shotPath = path.join(shotsDir, `step-${String(idx).padStart(2,'0')}.png`);
     try { await page.screenshot({ path: shotPath, fullPage: true }); } catch {}
-
     results.push({
       index: idx,
       step: s.raw,
@@ -273,7 +251,6 @@ export async function runWebTests({ steps, baseUrl, runId }) {
     });
   }
 
-  // video artifact
   let video = null;
   try { video = (await page.video().path()).replace(process.cwd() + '/', ''); } catch {}
   await context.close();
