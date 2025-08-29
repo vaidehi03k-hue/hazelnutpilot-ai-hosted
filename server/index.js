@@ -70,15 +70,19 @@ app.get('/api/projects', (_req, res) => {
 app.post('/api/projects', (req, res) => {
   const { name, baseUrl } = req.body || {};
   if (!name) return res.status(400).json({ ok: false, error: 'name required' });
+
   const db = loadDB();
   const id = crypto.randomUUID?.() || String(Date.now());
+
   const project = {
-    id, name, baseUrl: baseUrl || '', createdAt: new Date().toISOString(),
+    id, name, baseUrl: baseUrl || '',
+    createdAt: new Date().toISOString(),
     lastPrdText: '', lastGeneratedSteps: [], runs: []
   };
+
   db.projects.unshift(project);
   saveDB(db);
-  res.json({ ok: true, project });
+  res.json({ ok: true, project });   // <-- important: project.id is here
 });
 
 app.get('/api/projects/:id', (req, res) => {
