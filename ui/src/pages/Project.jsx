@@ -1,77 +1,198 @@
-import React, { useEffect, useState } from 'react'
-import { useParams } from 'react-router-dom'
-import api from '../api'
-export default function Project(){
-  const { id } = useParams()
-  const [project, setProject] = useState(null)
-  const [baseUrl, setBaseUrl] = useState('')
-  const [prdFile, setPrdFile] = useState(null)
-  const [prdId, setPrdId] = useState(null)
-  const [tests, setTests] = useState([])
-  const [running, setRunning] = useState(false)
-  const [message, setMessage] = useState('')
-  useEffect(()=>{ (async()=>{ const r=await api.get('/projects/' + id); setProject(r.data) })() },[id])
-  async function uploadPRD(){
-    if (!prdFile) return alert('Choose a PRD file first')
-    const text = await prdFile.text()
-    const r = await api.post('/projects/' + id + '/upload-prd', { text })
-    setPrdId(r.data.prdId); alert('PRD uploaded.')
+// ui/src/pages/Project.jsx
+import { useEffect, useMemo, useState } from "react";
+import { useParams, Link } from "react-router-dom";
+import api from "../api";
+
+export default function Project() {
+  const { id } = useParams();
+  const [project, setProject] = useState(null);
+  const [baseUrl, setBaseUrl] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  const [plans, setPlans] = useState([]);
+  const [uploading, setUploading] = useState(false);
+
+  const [job, setJob] = useState(null); // latest run
+
+  async function fetchProject() {
+    const r = await api.get("/projects/" + id);
+    const p = r.data?.project;
+    setProject(p || null);
+    setBaseUrl(p?.baseUrl || "");
   }
-  async function generateTests(){
-    if (!prdId) return alert('Upload PRD first')
-    if (!baseUrl) return alert('Enter Base URL')
-    setMessage('Generating tests…')
-    const r = await api.post('/projects/' + id + '/generate-tests', { prdId, baseUrl })
-    setTests(r.data.tests || [])
-    setMessage('Generated ' + (r.data.tests?.length || 0) + ' tests.')
+
+  async function fetchPlans() {
+    const r = await api.get(`/projects/${id}/plans`);
+    setPlans(r.data?.plans || []);
   }
-  async function runWeb(){
-    if (!tests.length) return alert('Generate tests first')
-    setRunning(true); setMessage('Running…')
-    await api.post('/projects/' + id + '/run-web', { tests })
-    const fresh = await api.get('/projects/' + id)
-    setProject(fresh.data); setRunning(false); setMessage('Done.')
+
+  useEffect(() => {
+    (async () => {
+      try {
+        await fetchProject();
+        await fetchPlans();
+      } catch (e) {
+        console.error(e); alert("Failed to load project");
+      } finally {
+        setLoading(false);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  const title = useMemo(() => project?.name ? `Project: ${project.name}` : "Project", [project]);
+
+  async function saveBaseUrl() {
+    try {
+      setSaving(true);
+      await api.put("/projects/" + id, { baseUrl });
+      await fetchProject();
+    } catch (e) { console.error(e); alert("Failed to save Base URL"); }
+    finally { setSaving(false); }
   }
-  return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold">{project?.name || 'Project'}</h1>
-      <div className="bg-white rounded-2xl p-4 shadow space-y-3">
-        <label className="block">
-          <span className="text-sm text-slate-600">Base URL</span>
-          <input value={baseUrl} onChange={e=>setBaseUrl(e.target.value)} placeholder="https://www.saucedemo.com/" className="mt-1 w-full rounded-xl border p-2" />
-        </label>
-        <label className="block">
-          <span className="text-sm text-slate-600">Upload PRD (md/txt)</span>
-          <input type="file" accept=".md,.txt" onChange={e=>setPrdFile(e.target.files[0])} className="mt-1" />
-        </label>
-        <div className="flex gap-3">
-          <button onClick={uploadPRD} className="rounded-xl bg-slate-700 px-4 py-2 text-white hover:bg-slate-600">Upload PRD</button>
-          <button onClick={generateTests} className="rounded-xl bg-indigo-600 px-4 py-2 text-white hover:bg-indigo-500">Generate Tests (AI)</button>
-          <button onClick={runWeb} disabled={running} className="rounded-xl bg-emerald-600 px-4 py-2 text-white disabled:opacity-50">Run Web</button>
-        </div>
-        <div className="text-sm text-slate-600">{message}</div>
-      </div>
-      <div className="bg-white rounded-2xl p-4 shadow">
-        <h2 className="font-semibold">Generated Tests</h2>
-        <pre className="mt-3 text-xs overflow-auto bg-slate-50 p-3 rounded-xl border">{JSON.stringify(tests, null, 2)}</pre>
-      </div>
-      <div className="bg-white rounded-2xl p-4 shadow">
-        <h2 className="font-semibold mb-2">Run History</h2>
-        <div className="divide-y text-sm">
-          {(project?.runs ?? []).map((r, idx) => (
-            <div key={idx} className="py-2 flex items-center justify-between">
-              <div>
-                <div className="font-medium">{r.when}</div>
-                <div className="text-slate-600">Pass: {r.pass} • Fail: {r.fail}</div>
-              </div>
-              <div className="flex gap-3">
-                {r.screenshots?.length ? <a href={r.screenshots[0]} className="text-slate-600 hover:underline">Screenshot</a> : null}
-              </div>
-            </div>
-          ))}
-          {(!project?.runs || project.runs.length === 0) && <div className="py-6 text-center text-slate-500">No runs yet.</div>}
-        </div>
-      </div>
+
+  async function uploadPrd(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      setUploading(true);
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("baseUrl", baseUrl || "");
+      const r = await api.post(`/projects/${id}/prd`, fd, {
+        headers: { "Content-Type": "multipart/form-data" }
+      });
+      if (!r.data?.ok) throw new Error(r.data?.error || "generation failed");
+      await fetchPlans();
+      alert("Test plan generated from PRD");
+    } catch (err) {
+      console.error(err);
+      alert("Failed to generate tests from PRD");
+    } finally {
+      setUploading(false);
+      e.target.value = ""; // reset file input
+    }
+  }
+
+  async function runPlan(planId) {
+    try {
+      const r = await api.post(`/plans/${planId}/run`, { baseUrl });
+      if (!r.data?.ok) throw new Error("Failed to start");
+      const jobId = r.data.jobId;
+      // simple polling
+      const poll = async () => {
+        const jr = await api.get(`/jobs/${jobId}`);
+        setJob({ jobId, ...jr.data });
+        if (jr.data.status === "running") setTimeout(poll, 1000);
+      };
+      await poll();
+    } catch (e) {
+      console.error(e);
+      alert("Run failed to start");
+    }
+  }
+
+  if (loading) return (
+    <div className="p-6">
+      <Link to="/" className="text-sm text-slate-600 hover:underline">← Back</Link>
+      <h1 className="mt-2 text-2xl font-semibold">{title}</h1>
+      <p className="mt-3 text-slate-600">Loading…</p>
     </div>
-  )
+  );
+
+  if (!project) return (
+    <div className="p-6">
+      <Link to="/" className="text-sm text-slate-600 hover:underline">← Back</Link>
+      <h1 className="mt-2 text-2xl font-semibold">Project not found</h1>
+      <p className="mt-3 text-slate-600">We couldn’t load this project.</p>
+    </div>
+  );
+
+  return (
+    <div className="p-6 space-y-8">
+      <div className="flex items-center justify-between">
+        <div>
+          <Link to="/" className="text-sm text-slate-600 hover:underline">← Back</Link>
+          <h1 className="mt-2 text-2xl font-semibold">{project.name}</h1>
+          <p className="text-slate-600">ID: {project.id}</p>
+        </div>
+      </div>
+
+      <section className="rounded-xl border p-4 space-y-3">
+        <h2 className="text-lg font-medium">Base URL</h2>
+        <input
+          className="w-full rounded-lg border px-3 py-2"
+          placeholder="https://example.com"
+          value={baseUrl}
+          onChange={(e) => setBaseUrl(e.target.value)}
+        />
+        <div className="flex items-center gap-3">
+          <button
+            disabled={saving}
+            className="px-3 py-2 rounded-lg bg-black text-white disabled:opacity-50"
+            onClick={saveBaseUrl}
+          >
+            {saving ? "Saving…" : "Save"}
+          </button>
+          {project.baseUrl ? (
+            <a href={project.baseUrl} target="_blank" rel="noreferrer" className="text-slate-700 hover:underline">Open Base URL</a>
+          ) : null}
+        </div>
+      </section>
+
+      <section className="rounded-xl border p-4 space-y-4">
+        <h2 className="text-lg font-medium">Upload PRD → Generate Tests (AI)</h2>
+        <input type="file" accept=".pdf,.docx,.md,.txt" onChange={uploadPrd} disabled={uploading} />
+        <p className="text-sm text-slate-600">
+          {uploading ? "Generating test plan from PRD…" : "Supported: PDF, DOCX, MD, TXT"}
+        </p>
+
+        <div className="pt-3">
+          <h3 className="font-medium mb-2">Generated Plans</h3>
+          {plans.length === 0 ? (
+            <div className="text-slate-600 text-sm">No plans yet.</div>
+          ) : (
+            <ul className="grid gap-3">
+              {plans.map(p => (
+                <li key={p.id} className="flex items-center justify-between rounded-xl border p-3">
+                  <div className="space-y-1">
+                    <div className="font-medium">{p.suiteName || p.fileName}</div>
+                    <div className="text-xs text-slate-600">Plan ID: {p.id}</div>
+                    <div className="text-xs text-slate-600">Created: {new Date(p.createdAt).toLocaleString()}</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button className="px-3 py-2 rounded-lg border hover:bg-slate-50" onClick={() => runPlan(p.id)}>Run</button>
+                    <a className="text-sm text-slate-700 hover:underline" href={`/plans/${p.id}/plan.json`} target="_blank" rel="noreferrer">View JSON</a>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </section>
+
+      {job && (
+        <section className="rounded-xl border p-4 space-y-3">
+          <h2 className="text-lg font-medium">Latest Run</h2>
+          <div className="text-sm">Status: <span className="font-medium">{job.status}</span></div>
+          {job.artifacts?.video && (
+            <video src={job.artifacts.video} controls className="w-full rounded-lg border" />
+          )}
+          <div className="grid grid-cols-2 gap-3">
+            {(job.artifacts?.screenshots || []).map((s) => (
+              <img key={s} alt="step" src={s} className="w-full rounded-lg border" />
+            ))}
+          </div>
+
+          {job.results && (
+            <details className="rounded-lg bg-slate-50 p-3">
+              <summary className="cursor-pointer font-medium">Raw Results JSON</summary>
+              <pre className="text-xs overflow-auto">{JSON.stringify(job.results, null, 2)}</pre>
+            </details>
+          )}
+        </section>
+      )}
+    </div>
+  );
 }
