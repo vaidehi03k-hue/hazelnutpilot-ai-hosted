@@ -2,57 +2,109 @@
 import * as path from 'node:path';
 import * as fsp from 'node:fs/promises';
 
+function isRegexString(s) {
+  return typeof s === 'string' && s.startsWith('/') && s.lastIndexOf('/') > 0;
+}
+function asRegex(pat) {
+  if (!pat) return /.*/i;
+  if (pat instanceof RegExp) return pat;
+  if (isRegexString(pat)) {
+    const last = pat.lastIndexOf('/');
+    const body = pat.slice(1, last);
+    const flags = pat.slice(last + 1) || 'i';
+    try { return new RegExp(body, flags); } catch { return new RegExp(body, 'i'); }
+  }
+  // plain string => fuzzy, case-insensitive
+  const esc = String(pat).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(esc, 'i');
+}
+
+// When target is a string, treat it as a text locator by default
+function normalizeTarget(t) {
+  if (t == null) return null;
+  if (typeof t === 'string') return { text: t };
+  if (typeof t === 'object') {
+    const out = { ...t };
+    if (typeof out.text === 'string') out.text = out.text;   // regex string allowed
+    if (typeof out.name === 'string') out.name = out.name;
+    if (typeof out.label === 'string') out.label = out.label;
+    return out;
+  }
+  return t;
+}
+
+async function locatorFor(page, t) {
+  const tgt = normalizeTarget(t);
+  if (!tgt) throw new Error('Missing target');
+
+  // Role + name/label preferred
+  if (tgt.role && (tgt.name || tgt.label)) {
+    if (tgt.label) return page.getByRole(tgt.role, { name: asRegex(tgt.label) });
+    if (tgt.name)  return page.getByRole(tgt.role, { name: asRegex(tgt.name) });
+  }
+
+  // Accessible-friendly fallbacks
+  if (tgt.label)       return page.getByLabel(asRegex(tgt.label));
+  if (tgt.text)        return page.getByText(asRegex(tgt.text));
+  if (tgt.placeholder) return page.getByPlaceholder(asRegex(tgt.placeholder));
+  if (tgt.testId)      return page.getByTestId(tgt.testId);
+
+  // Direct selectors
+  if (tgt.css)         return page.locator(tgt.css);
+  if (tgt.xpath)       return page.locator(`xpath=${tgt.xpath}`);
+
+  throw new Error('Unresolvable target: ' + JSON.stringify(t));
+}
+
+// Click with smart fallbacks on Playwright strict violations (multiple matches)
+async function smartClick(page, t, timeout = 10000) {
+  const tgt = normalizeTarget(t);
+  try {
+    const loc = await locatorFor(page, tgt);
+    await loc.click({ timeout });
+    return;
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const patt = (tgt?.text || tgt?.name || tgt?.label);
+    // If multiple matches or strict violation, try role-based guesses, then first()
+    if (/strict mode violation|resolved to \d+ elements/i.test(msg) && patt) {
+      const rex = asRegex(patt);
+      try { await page.getByRole('button', { name: rex }).first().click({ timeout }); return; } catch {}
+      try { await page.getByRole('link',   { name: rex }).first().click({ timeout }); return; } catch {}
+      try {
+        const loc2 = await locatorFor(page, tgt);
+        await loc2.first().click({ timeout });
+        return;
+      } catch {}
+    }
+    throw e;
+  }
+}
+
+// Select option accepting value/label/index and plain strings ("Option 2" or "2")
+async function smartSelect(page, t, value, timeout = 10000) {
+  const loc = await locatorFor(page, t);
+  let opt = value;
+  if (typeof opt === 'string') {
+    // Numeric-looking? treat as value; else treat as label
+    if (/^\d+$/.test(opt.trim())) {
+      // keep as string "2" (value)
+    } else {
+      opt = { label: opt }; // "Option 2" -> label
+    }
+  } else if (opt && typeof opt === 'object') {
+    // pass through {value|label|index}
+  }
+  await loc.selectOption(opt, { timeout });
+}
+
+// Join base and relative
 function joinUrl(base, rel) {
   if (!rel) return base || '/';
   if (rel.startsWith('http')) return rel;
   const b = (base || '').replace(/\/+$/, '');
   const r = rel.startsWith('/') ? rel : `/${rel}`;
   return b + r;
-}
-function asRegex(pat) {
-  if (!pat) return /.*/;
-  if (typeof pat === 'string' && pat.startsWith('/') && pat.lastIndexOf('/') > 0) {
-    const last = pat.lastIndexOf('/');
-    const body = pat.slice(1, last);
-    const flags = pat.slice(last + 1) || 'i';
-    return new RegExp(body, flags);
-  }
-  return new RegExp(pat, 'i');
-}
-async function locatorFor(page, t) {
-  if (!t) throw new Error('Missing target');
-  if (typeof t === 'string') return page.getByText(asRegex(t)); // allow plain text
-  if (t.role && (t.name || t.label)) {
-    if (t.label) return page.getByRole(t.role, { name: asRegex(t.label) });
-    if (t.name)  return page.getByRole(t.role, { name: asRegex(t.name) });
-  }
-  if (t.label)       return page.getByLabel(asRegex(t.label));
-  if (t.text)        return page.getByText(asRegex(t.text));
-  if (t.placeholder) return page.getByPlaceholder(asRegex(t.placeholder));
-  if (t.testId)      return page.getByTestId(t.testId);
-  if (t.css)         return page.locator(t.css);
-  if (t.xpath)       return page.locator(`xpath=${t.xpath}`);
-  throw new Error('Unresolvable target: ' + JSON.stringify(t));
-}
-
-// Accept expect*/navigate/type synonyms & shorthands
-function normalizeStep(s) {
-  const aliases = {
-    navigate: 'goto', open: 'goto', go: 'goto',
-    type: 'fill', input: 'fill',
-    presskey: 'press', 'press-key': 'press',
-    selectoption: 'select', 'select-option': 'select',
-    checkbox: 'check', uncheckbox: 'uncheck',
-    waitfor: 'waitForVisible', 'waitforvisible': 'waitForVisible',
-    expecttext: 'assertText', expectvisible: 'assertVisible', expecturl: 'assertUrl'
-  };
-  const key = String(s.step || '').toLowerCase();
-  if (aliases[key]) s.step = aliases[key];
-
-  if (s.step === 'goto' && s.url && !s.target) s.target = s.url;
-  if (s.step === 'fill' && s.text != null && s.value == null) s.value = s.text;
-  if (s.regex && s.pattern == null) s.pattern = s.regex;
-  return s;
 }
 
 export async function runWebTests({ steps, baseUrl, runId, video = true, maxRunMs = 120000 }) {
@@ -70,7 +122,6 @@ export async function runWebTests({ steps, baseUrl, runId, video = true, maxRunM
     recordVideo: video ? { dir: outDir, size: { width: 1280, height: 720 } } : undefined
   });
   const page = await context.newPage();
-
   page.setDefaultTimeout(15000);
   page.setDefaultNavigationTimeout(20000);
 
@@ -93,7 +144,7 @@ export async function runWebTests({ steps, baseUrl, runId, video = true, maxRunM
         break;
       }
 
-      const s = normalizeStep({ ...steps[i] });
+      const s = { ...(steps[i] || {}) };
       const n = i + 1;
       const snap = path.join(outDir, `${String(n).padStart(2, '0')}.png`);
       let status = 'ok', error = null;
@@ -106,68 +157,86 @@ export async function runWebTests({ steps, baseUrl, runId, video = true, maxRunM
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
             break;
           }
-          case 'click':
+          case 'click': {
             log(`STEP ${n}: click ${JSON.stringify(s.target)}`);
-            await (await locatorFor(page, s.target)).click({ timeout: 10000 });
+            await smartClick(page, s.target, 10000);
             break;
-          case 'fill':
+          }
+          case 'fill': {
             log(`STEP ${n}: fill ${JSON.stringify(s.target)} value=${String(s.value ?? '')}`);
-            await (await locatorFor(page, s.target)).fill(String(s.value ?? ''), { timeout: 10000 });
+            const loc = await locatorFor(page, s.target);
+            await loc.fill(String(s.value ?? ''), { timeout: 10000 });
             break;
-          case 'press':
+          }
+          case 'press': {
             log(`STEP ${n}: press ${JSON.stringify(s.target)} key=${s.key || 'Enter'}`);
-            await (await locatorFor(page, s.target)).press(String(s.key || 'Enter'), { timeout: 10000 });
+            const loc = await locatorFor(page, s.target);
+            await loc.press(String(s.key || 'Enter'), { timeout: 10000 });
             break;
-          case 'select':
-            log(`STEP ${n}: select ${JSON.stringify(s.target)} -> ${String(s.value)}`);
-            await (await locatorFor(page, s.target)).selectOption(String(s.value), { timeout: 10000 });
+          }
+          case 'select': {
+            log(`STEP ${n}: select ${JSON.stringify(s.target)} -> ${JSON.stringify(s.value)}`);
+            await smartSelect(page, s.target, s.value, 10000);
             break;
-          case 'check':
+          }
+          case 'check': {
             log(`STEP ${n}: check ${JSON.stringify(s.target)}`);
-            await (await locatorFor(page, s.target)).check({ timeout: 10000 });
+            const loc = await locatorFor(page, s.target);
+            await loc.check({ timeout: 10000 });
             break;
-          case 'uncheck':
+          }
+          case 'uncheck': {
             log(`STEP ${n}: uncheck ${JSON.stringify(s.target)}`);
-            await (await locatorFor(page, s.target)).uncheck({ timeout: 10000 });
+            const loc = await locatorFor(page, s.target);
+            await loc.uncheck({ timeout: 10000 });
             break;
-          case 'waitForVisible':
+          }
+          case 'waitForVisible': {
             log(`STEP ${n}: waitForVisible ${JSON.stringify(s.target)}`);
-            await (await locatorFor(page, s.target)).waitFor({ state: 'visible', timeout: 10000 });
-            break;
-          case 'assertText': {
-            let tgt = s.target;
-            let pat = s.pattern ?? s.text ?? (typeof tgt === 'string' ? tgt : undefined);
-            if (typeof tgt === 'string') tgt = { text: tgt };
-            if (!tgt && pat) {
-              log(`STEP ${n}: assertText (page) ~ ${pat}`);
-              await page.getByText(asRegex(pat)).waitFor({ state: 'visible', timeout: 10000 });
-              break;
-            }
-            if (!tgt) throw new Error('assertText needs a target or pattern/text');
-            if (!pat) pat = tgt.text || tgt.label || '';
-            log(`STEP ${n}: assertText ${JSON.stringify(tgt)} ~ ${pat}`);
-            const loc = await locatorFor(page, tgt);
+            const loc = await locatorFor(page, s.target);
             await loc.waitFor({ state: 'visible', timeout: 10000 });
-            const txt = await loc.innerText();
-            if (!asRegex(pat).test(txt)) throw new Error(`assertText failed: got "${txt}", expected ${pat}`);
+            break;
+          }
+          case 'assertText': {
+            // Accept: target string (page-level text) OR target locator + pattern/text
+            const patt = s.pattern ?? s.text ?? (typeof s.target === 'string' ? s.target : null);
+            if (!s.target || typeof s.target === 'string') {
+              log(`STEP ${n}: assertText (page) ~ ${patt}`);
+              await page.getByText(asRegex(patt)).waitFor({ state: 'visible', timeout: 10000 });
+            } else {
+              log(`STEP ${n}: assertText ${JSON.stringify(s.target)} ~ ${patt}`);
+              const loc = await locatorFor(page, s.target);
+              await loc.waitFor({ state: 'visible', timeout: 10000 });
+              const txt = await loc.innerText();
+              if (!asRegex(patt).test(txt)) throw new Error(`assertText failed: got "${txt}", expected ${patt}`);
+            }
             break;
           }
           case 'assertVisible': {
             const tgt = typeof s.target === 'string' ? { text: s.target } : s.target;
             log(`STEP ${n}: assertVisible ${JSON.stringify(tgt)}`);
-            await (await locatorFor(page, tgt)).waitFor({ state: 'visible', timeout: 10000 });
+            const loc = await locatorFor(page, tgt);
+            await loc.waitFor({ state: 'visible', timeout: 10000 });
             break;
           }
           case 'assertUrl': {
+            const patt = s.pattern || s.contains || '';
             const url = page.url();
-            log(`STEP ${n}: assertUrl ~ ${s.pattern} on ${url}`);
-            if (!asRegex(s.pattern).test(url)) throw new Error(`assertUrl failed: "${url}" !~ ${s.pattern}`);
+            log(`STEP ${n}: assertUrl ~ ${patt} on ${url}`);
+            const rx = isRegexString(patt) ? asRegex(patt) : asRegex(String(patt));
+            if (!rx.test(url)) throw new Error(`assertUrl failed: "${url}" !~ ${patt}`);
             break;
           }
-          case 'screenshot':
+          case 'sleep': {
+            const ms = Number(s.ms || s.duration || 1000);
+            log(`STEP ${n}: sleep ${ms}ms`);
+            await new Promise(r => setTimeout(r, ms));
+            break;
+          }
+          case 'screenshot': {
             log(`STEP ${n}: screenshot`);
             break;
-
+          }
           default:
             throw new Error(`Unknown step: ${s.step}`);
         }
@@ -193,7 +262,7 @@ export async function runWebTests({ steps, baseUrl, runId, video = true, maxRunM
     try { await browser.close(); } catch {}
     if (video && videoHandle) {
       const save = (async () => { try { await videoHandle.saveAs(path.join(outDir, 'run.webm')); } catch {} })();
-      await Promise.race([save, new Promise(r => setTimeout(r, 3000))]); // don't block response
+      await Promise.race([save, new Promise(r => setTimeout(r, 3000))]); // don't block response forever
     }
   }
 
