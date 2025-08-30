@@ -9,6 +9,7 @@ function joinUrl(base, rel) {
   const r = rel.startsWith('/') ? rel : `/${rel}`;
   return b + r;
 }
+
 function asRegex(pat) {
   if (!pat) return /.*/;
   if (typeof pat === 'string' && pat.startsWith('/') && pat.lastIndexOf('/') > 0) {
@@ -19,8 +20,10 @@ function asRegex(pat) {
   }
   return new RegExp(pat, 'i');
 }
+
 async function locatorFor(page, t) {
   if (!t) throw new Error('Missing target');
+  if (typeof t === 'string') return page.getByText(asRegex(t));       // NEW: allow plain string targets
   if (t.role && (t.name || t.label)) {
     if (t.label) return page.getByRole(t.role, { name: asRegex(t.label) });
     if (t.name)  return page.getByRole(t.role, { name: asRegex(t.name) });
@@ -34,7 +37,7 @@ async function locatorFor(page, t) {
   throw new Error('Unresolvable target: ' + JSON.stringify(t));
 }
 
-// Normalize step name & fields (accepts "expect*" and common synonyms)
+// Normalize step names & common field aliases
 function normalizeStep(s) {
   const aliases = {
     navigate: 'goto', open: 'goto', go: 'goto',
@@ -48,7 +51,7 @@ function normalizeStep(s) {
   const key = String(s.step || '').toLowerCase();
   if (aliases[key]) s.step = aliases[key];
 
-  // Common field aliases
+  // Field shorthands
   if (s.step === 'goto' && s.url && !s.target) s.target = s.url;
   if (s.step === 'fill' && s.text != null && s.value == null) s.value = s.text;
   if (s.regex && s.pattern == null) s.pattern = s.regex;
@@ -57,7 +60,7 @@ function normalizeStep(s) {
 }
 
 export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) {
-  // lazy-load Playwright so boot doesn't crash if devDeps are skipped
+  // lazy-load Playwright
   const { chromium } = await import('playwright');
 
   const outDir = path.join(process.cwd(), 'runs', runId);
@@ -99,17 +102,19 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
         break;
       }
 
-      const s = normalizeStep({ ...steps[i] }); // 🔁 normalize aliases/fields
+      const s = normalizeStep({ ...steps[i] });
       const n = i + 1;
       const snap = path.join(outDir, `${String(n).padStart(2, '0')}.png`);
       let status = 'ok', error = null;
 
       try {
         switch (s.step) {
-          case 'goto':
-            log(`STEP ${n}: goto ${joinUrl(baseUrl, s.target || '/')}`);
-            await page.goto(joinUrl(baseUrl, s.target || '/'), { waitUntil: 'domcontentloaded', timeout: 20000 });
+          case 'goto': {
+            const url = joinUrl(baseUrl, s.target || '/');
+            log(`STEP ${n}: goto ${url}`);
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
             break;
+          }
 
           case 'click':
             log(`STEP ${n}: click ${JSON.stringify(s.target)}`);
@@ -147,18 +152,34 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
             break;
 
           case 'assertText': {
-            log(`STEP ${n}: assertText ${JSON.stringify(s.target)} ~ ${s.pattern}`);
-            const loc = await locatorFor(page, s.target);
+            // Flexible: allow string target, and/or infer pattern
+            let tgt = s.target;
+            let pat = s.pattern ?? s.text ?? (typeof tgt === 'string' ? tgt : undefined);
+            if (typeof tgt === 'string') tgt = { text: tgt };
+            // If only a pattern was provided, assert that some element with that text is visible
+            if (!tgt && pat) {
+              log(`STEP ${n}: assertText (page) ~ ${pat}`);
+              await page.getByText(asRegex(pat)).waitFor({ state: 'visible', timeout: 10000 });
+              break;
+            }
+            // If neither present, fail
+            if (!tgt) throw new Error('assertText needs a target or pattern/text');
+            if (!pat) pat = tgt.text || tgt.label || '';
+            log(`STEP ${n}: assertText ${JSON.stringify(tgt)} ~ ${pat}`);
+            const loc = await locatorFor(page, tgt);
             await loc.waitFor({ state: 'visible', timeout: 10000 });
             const txt = await loc.innerText();
-            if (!asRegex(s.pattern).test(txt)) throw new Error(`assertText failed: got "${txt}", expected ${s.pattern}`);
+            if (!asRegex(pat).test(txt)) throw new Error(`assertText failed: got "${txt}", expected ${pat}`);
             break;
           }
 
-          case 'assertVisible':
-            log(`STEP ${n}: assertVisible ${JSON.stringify(s.target)}`);
-            await (await locatorFor(page, s.target)).waitFor({ state: 'visible', timeout: 10000 });
+          case 'assertVisible': {
+            // Allow string target
+            const tgt = typeof s.target === 'string' ? { text: s.target } : s.target;
+            log(`STEP ${n}: assertVisible ${JSON.stringify(tgt)}`);
+            await (await locatorFor(page, tgt)).waitFor({ state: 'visible', timeout: 10000 });
             break;
+          }
 
           case 'assertUrl': {
             const url = page.url();
@@ -187,8 +208,11 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
     }
   } finally {
     try { await fsp.writeFile(path.join(outDir, 'run.log'), logLines.join('\n')); } catch {}
-    const v = await page.video();
-    if (v) { try { await v.saveAs(path.join(outDir, 'run.webm')); } catch {} }
+    // save video
+    try {
+      const v = await (await context.pages())[0]?.video?.();
+      if (v) await v.saveAs(path.join(outDir, 'run.webm'));
+    } catch {}
     await context.close();
     await browser.close();
   }
