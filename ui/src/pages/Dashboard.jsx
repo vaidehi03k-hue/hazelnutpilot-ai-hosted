@@ -1,24 +1,25 @@
-// src/pages/Dashboard.jsx
+// ui/src/pages/Dashboard.jsx
 import React from "react";
 import { API_BASE, apiGet, apiPost } from "../api";
 
 export default function Dashboard() {
   const [projects, setProjects] = React.useState([]);
+  const [totals, setTotals] = React.useState({ projects: 0, runs: 0, passRate: 0 });
   const [loading, setLoading] = React.useState(true);
   const [err, setErr] = React.useState("");
 
-  const [name, setName] = React.useState("");
-  const [baseUrl, setBaseUrl] = React.useState("");
-  const [creating, setCreating] = React.useState(false);
-
+  // load summary + projects (matches your original dashboard)
   React.useEffect(() => {
     let off = false;
     (async () => {
       try {
         setLoading(true);
         setErr("");
-        const j = await apiGet("/api/projects");
-        if (!off) setProjects(j.projects || []);
+        const s = await apiGet("/api/summary");   // { totals: {projects,runs,passRate}, projects:[...] }
+        const p = await apiGet("/api/projects");  // { ok:true, projects:[...] }
+        if (off) return;
+        setTotals(s?.totals || { projects: 0, runs: 0, passRate: 0 });
+        setProjects(Array.isArray(p?.projects) ? p.projects : []);
       } catch (e) {
         if (!off) setErr(String(e?.message || e));
       } finally {
@@ -28,123 +29,93 @@ export default function Dashboard() {
     return () => { off = true; };
   }, []);
 
-  async function createProject(e) {
-    e?.preventDefault?.();
-    if (!name.trim()) {
-      setErr("Please enter a project name.");
-      return;
-    }
+  async function createViaPrompt() {
+    const name = window.prompt("Project name?")?.trim();
+    if (!name) return;
+    const baseUrl = window.prompt("Base URL (optional)?")?.trim() || "";
+
     try {
-      setCreating(true);
-      setErr("");
-      const payload = { name: name.trim(), baseUrl: baseUrl.trim() };
-      console.log("[create] POST", `${API_BASE}/api/projects`, payload);
-      const j = await apiPost("/api/projects", payload);
-      const p = j?.project;
-      if (!p?.id) throw new Error("API did not return a project id");
-      // optimistic add
-      setProjects(prev => [p, ...prev]);
-      // ✅ use query param to avoid Vercel 404s
-      window.location.href = `/project?id=${p.id}`;
+      const j = await apiPost("/api/projects", { name, baseUrl }); // server requires { name }
+      const id = j?.project?.id;
+      if (!id) throw new Error("API did not return a project id");
+      // navigate exactly like your old UI did (pretty path)
+      window.location.href = `/project/${id}`;
     } catch (e) {
-      setErr(String(e?.message || e));
-      console.error("[create] error:", e);
-    } finally {
-      setCreating(false);
+      alert("Create failed: " + (e?.message || e));
     }
   }
 
   return (
-    <div className="max-w-5xl mx-auto p-6 space-y-8">
-      <header className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Projects</h1>
-        <code className="text-xs text-gray-500">API: {API_BASE}</code>
-      </header>
+    <div className="p-6">
+      {/* top bar */}
+      <div className="flex items-center justify-between">
+        <h1 className="text-3xl font-serif font-bold">Dashboard</h1>
+        <button
+          onClick={createViaPrompt}
+          className="border px-3 py-1 rounded hover:bg-gray-50"
+          title="Create a new project"
+        >
+          + New Project
+        </button>
+      </div>
 
+      {/* tiny debug line to confirm API host being used */}
+      <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>API: {API_BASE}</div>
+
+      {/* error banner */}
       {err && (
-        <div className="rounded border border-red-200 bg-red-50 text-red-800 p-3 text-sm">
+        <div className="mt-3 text-sm text-red-700 border border-red-200 bg-red-50 rounded p-3">
           {err}
         </div>
       )}
 
-      <form onSubmit={createProject} className="rounded border p-4 bg-white space-y-3">
-        <div className="text-lg font-semibold">New Project</div>
-        <div className="grid md:grid-cols-2 gap-3">
-          <div>
-            <label className="block text-sm mb-1">Name *</label>
-            <input
-              className="w-full border rounded px-3 py-2"
-              placeholder="e.g. Internet Demo"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </div>
-          <div>
-            <label className="block text-sm mb-1">Base URL (optional)</label>
-            <input
-              className="w-full border rounded px-3 py-2"
-              placeholder="https://the-internet.herokuapp.com"
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-            />
-          </div>
-        </div>
-        <button
-          type="submit"
-          disabled={creating}
-          className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700"
-        >
-          {creating ? "Creating…" : "Create Project"}
-        </button>
-      </form>
+      {/* summary table – visually similar to your old one */}
+      <div className="mt-6 border">
+        <div className="border-b px-2 py-1">Projects</div>
+        <div className="px-2 py-1">{totals.projects}</div>
+      </div>
+      <div className="border">
+        <div className="border-b px-2 py-1">Total Runs</div>
+        <div className="px-2 py-1">{totals.runs}</div>
+      </div>
+      <div className="border">
+        <div className="border-b px-2 py-1">Pass Rate</div>
+        <div className="px-2 py-1">{totals.passRate}%</div>
+      </div>
 
-      <section className="space-y-2">
-        <div className="text-lg font-semibold">All Projects</div>
-        {loading ? (
-          <div className="text-sm text-gray-500">Loading…</div>
-        ) : projects.length === 0 ? (
-          <div className="text-sm text-gray-500">No projects yet.</div>
-        ) : (
-          <div className="border rounded overflow-hidden">
-            <table className="min-w-full text-sm">
-              <thead>
-                <tr className="text-left border-b bg-gray-50">
-                  <th className="px-3 py-2">Name</th>
-                  <th className="px-3 py-2">Base URL</th>
-                  <th className="px-3 py-2">Runs</th>
-                  <th className="px-3 py-2">Last Run</th>
-                  <th className="px-3 py-2">Open</th>
-                </tr>
-              </thead>
-              <tbody>
-                {projects.map((p) => (
-                  <tr key={p.id} className="border-b">
-                    <td className="px-3 py-2">{p.name}</td>
-                    <td className="px-3 py-2">
-                      {p.baseUrl ? (
-                        <a className="underline text-blue-600" href={p.baseUrl} target="_blank" rel="noreferrer">
-                          {p.baseUrl}
-                        </a>
-                      ) : (
-                        <span className="text-gray-400">—</span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2">{p.runs ?? 0}</td>
-                    <td className="px-3 py-2">
-                      {p.lastRunAt ? new Date(p.lastRunAt).toLocaleString() : "—"}
-                    </td>
-                    <td className="px-3 py-2">
-                      <a className="px-3 py-1.5 rounded bg-green-600 text-white hover:bg-green-700" href={`/project?id=${p.id}`}>
-                        Open
-                      </a>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
+      {/* project list (very close to your original table feel) */}
+      <h2 className="mt-8 text-2xl font-serif font-semibold">Projects</h2>
+      {loading ? (
+        <div className="mt-2 text-sm text-gray-500">Loading…</div>
+      ) : projects.length === 0 ? (
+        <div className="mt-2 text-sm">No projects yet. Click “New Project”.</div>
+      ) : (
+        <div className="mt-3 border">
+          {projects.map((p) => (
+            <div key={p.id} className="flex items-center justify-between border-b px-2 py-2">
+              <div>
+                <div className="font-medium">{p.name}</div>
+                <div className="text-xs text-gray-500">ID: {p.id}</div>
+              </div>
+              <div className="flex items-center gap-3">
+                {p.baseUrl ? (
+                  <a className="underline text-blue-600" href={p.baseUrl} target="_blank" rel="noreferrer">
+                    Open base
+                  </a>
+                ) : (
+                  <span className="text-xs text-gray-400">no base URL</span>
+                )}
+                <a
+                  className="border px-2 py-1 rounded hover:bg-gray-50"
+                  href={`/project/${p.id}`}
+                >
+                  Open
+                </a>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
