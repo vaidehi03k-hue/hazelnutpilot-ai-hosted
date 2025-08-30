@@ -9,7 +9,6 @@ function joinUrl(base, rel) {
   const r = rel.startsWith('/') ? rel : `/${rel}`;
   return b + r;
 }
-
 function asRegex(pat) {
   if (!pat) return /.*/;
   if (typeof pat === 'string' && pat.startsWith('/') && pat.lastIndexOf('/') > 0) {
@@ -20,10 +19,9 @@ function asRegex(pat) {
   }
   return new RegExp(pat, 'i');
 }
-
 async function locatorFor(page, t) {
   if (!t) throw new Error('Missing target');
-  if (typeof t === 'string') return page.getByText(asRegex(t)); // allow plain string targets
+  if (typeof t === 'string') return page.getByText(asRegex(t)); // allow plain text
   if (t.role && (t.name || t.label)) {
     if (t.label) return page.getByRole(t.role, { name: asRegex(t.label) });
     if (t.name)  return page.getByRole(t.role, { name: asRegex(t.name) });
@@ -37,7 +35,7 @@ async function locatorFor(page, t) {
   throw new Error('Unresolvable target: ' + JSON.stringify(t));
 }
 
-// Accept expect*/navigate/type synonyms and field shorthands
+// Accept expect*/navigate/type synonyms & shorthands
 function normalizeStep(s) {
   const aliases = {
     navigate: 'goto', open: 'goto', go: 'goto',
@@ -54,13 +52,11 @@ function normalizeStep(s) {
   if (s.step === 'goto' && s.url && !s.target) s.target = s.url;
   if (s.step === 'fill' && s.text != null && s.value == null) s.value = s.text;
   if (s.regex && s.pattern == null) s.pattern = s.regex;
-
   return s;
 }
 
-export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) {
-  // lazy-load Playwright
-  const { chromium } = await import('playwright');
+export async function runWebTests({ steps, baseUrl, runId, video = true, maxRunMs = 120000 }) {
+  const { chromium } = await import('playwright'); // lazy-load
 
   const outDir = path.join(process.cwd(), 'runs', runId);
   await fsp.mkdir(outDir, { recursive: true });
@@ -71,20 +67,15 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
   });
   const context = await browser.newContext({
     ignoreHTTPSErrors: true,
-    recordVideo: { dir: outDir, size: { width: 1280, height: 720 } }
+    recordVideo: video ? { dir: outDir, size: { width: 1280, height: 720 } } : undefined
   });
   const page = await context.newPage();
 
-  // caps so nothing hangs forever
   page.setDefaultTimeout(15000);
   page.setDefaultNavigationTimeout(20000);
 
   const logLines = [];
-  const log = m => {
-    const line = `[${new Date().toISOString()}] ${m}`;
-    logLines.push(line);
-    console.log(line);
-  };
+  const log = m => { const line = `[${new Date().toISOString()}] ${m}`; logLines.push(line); console.log(line); };
   page.on('console', msg => log(`console:${msg.type()}: ${msg.text()}`));
   page.on('pageerror', err => log(`pageerror: ${err?.message || err}`));
   page.on('requestfailed', req => log(`requestfailed: ${req.method()} ${req.url()} -> ${req.failure()?.errorText}`));
@@ -144,7 +135,6 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
             await (await locatorFor(page, s.target)).waitFor({ state: 'visible', timeout: 10000 });
             break;
           case 'assertText': {
-            // allow string-only, or target+pattern
             let tgt = s.target;
             let pat = s.pattern ?? s.text ?? (typeof tgt === 'string' ? tgt : undefined);
             if (typeof tgt === 'string') tgt = { text: tgt };
@@ -177,6 +167,7 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
           case 'screenshot':
             log(`STEP ${n}: screenshot`);
             break;
+
           default:
             throw new Error(`Unknown step: ${s.step}`);
         }
@@ -188,25 +179,21 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
         try { await page.screenshot({ path: snap, fullPage: false }); } catch {}
         results.push({ ...s, status, error, screenshot: path.basename(snap) });
         if (status === 'ok') passed += 1;
-        if (status === 'error') break;
+        if (status === 'error') break; // stop on first failure
       }
     }
   } finally {
-    // write log
     try { await fsp.writeFile(path.join(outDir, 'run.log'), logLines.join('\n')); } catch {}
 
-    // fetch video handle before closing
     let videoHandle = null;
-    try { videoHandle = (await context.pages())[0]?.video?.(); } catch {}
-
-    // close context/browser quickly
+    if (video) {
+      try { videoHandle = (await context.pages())[0]?.video?.(); } catch {}
+    }
     try { await context.close(); } catch {}
     try { await browser.close(); } catch {}
-
-    // save video, but DO NOT BLOCK the response (race with 3s timeout)
-    if (videoHandle) {
+    if (video && videoHandle) {
       const save = (async () => { try { await videoHandle.saveAs(path.join(outDir, 'run.webm')); } catch {} })();
-      await Promise.race([save, new Promise(r => setTimeout(r, 3000))]);
+      await Promise.race([save, new Promise(r => setTimeout(r, 3000))]); // don't block response
     }
   }
 
@@ -214,7 +201,7 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
     summary: { total: results.length, passed, failed: results.length - passed },
     results,
     artifacts: {
-      video: `/runs/${runId}/run.webm`,
+      video: video ? `/runs/${runId}/run.webm` : null,
       screenshots: results.map(r => `/runs/${runId}/${r.screenshot}`),
       log: `/runs/${runId}/run.log`
     }
