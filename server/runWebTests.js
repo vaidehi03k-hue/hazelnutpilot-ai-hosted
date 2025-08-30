@@ -23,7 +23,7 @@ function asRegex(pat) {
 
 async function locatorFor(page, t) {
   if (!t) throw new Error('Missing target');
-  if (typeof t === 'string') return page.getByText(asRegex(t));       // NEW: allow plain string targets
+  if (typeof t === 'string') return page.getByText(asRegex(t)); // allow plain string targets
   if (t.role && (t.name || t.label)) {
     if (t.label) return page.getByRole(t.role, { name: asRegex(t.label) });
     if (t.name)  return page.getByRole(t.role, { name: asRegex(t.name) });
@@ -37,7 +37,7 @@ async function locatorFor(page, t) {
   throw new Error('Unresolvable target: ' + JSON.stringify(t));
 }
 
-// Normalize step names & common field aliases
+// Accept expect*/navigate/type synonyms and field shorthands
 function normalizeStep(s) {
   const aliases = {
     navigate: 'goto', open: 'goto', go: 'goto',
@@ -51,7 +51,6 @@ function normalizeStep(s) {
   const key = String(s.step || '').toLowerCase();
   if (aliases[key]) s.step = aliases[key];
 
-  // Field shorthands
   if (s.step === 'goto' && s.url && !s.target) s.target = s.url;
   if (s.step === 'fill' && s.text != null && s.value == null) s.value = s.text;
   if (s.regex && s.pattern == null) s.pattern = s.regex;
@@ -76,6 +75,7 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
   });
   const page = await context.newPage();
 
+  // caps so nothing hangs forever
   page.setDefaultTimeout(15000);
   page.setDefaultNavigationTimeout(20000);
 
@@ -115,54 +115,44 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
             break;
           }
-
           case 'click':
             log(`STEP ${n}: click ${JSON.stringify(s.target)}`);
             await (await locatorFor(page, s.target)).click({ timeout: 10000 });
             break;
-
           case 'fill':
             log(`STEP ${n}: fill ${JSON.stringify(s.target)} value=${String(s.value ?? '')}`);
             await (await locatorFor(page, s.target)).fill(String(s.value ?? ''), { timeout: 10000 });
             break;
-
           case 'press':
             log(`STEP ${n}: press ${JSON.stringify(s.target)} key=${s.key || 'Enter'}`);
             await (await locatorFor(page, s.target)).press(String(s.key || 'Enter'), { timeout: 10000 });
             break;
-
           case 'select':
             log(`STEP ${n}: select ${JSON.stringify(s.target)} -> ${String(s.value)}`);
             await (await locatorFor(page, s.target)).selectOption(String(s.value), { timeout: 10000 });
             break;
-
           case 'check':
             log(`STEP ${n}: check ${JSON.stringify(s.target)}`);
             await (await locatorFor(page, s.target)).check({ timeout: 10000 });
             break;
-
           case 'uncheck':
             log(`STEP ${n}: uncheck ${JSON.stringify(s.target)}`);
             await (await locatorFor(page, s.target)).uncheck({ timeout: 10000 });
             break;
-
           case 'waitForVisible':
             log(`STEP ${n}: waitForVisible ${JSON.stringify(s.target)}`);
             await (await locatorFor(page, s.target)).waitFor({ state: 'visible', timeout: 10000 });
             break;
-
           case 'assertText': {
-            // Flexible: allow string target, and/or infer pattern
+            // allow string-only, or target+pattern
             let tgt = s.target;
             let pat = s.pattern ?? s.text ?? (typeof tgt === 'string' ? tgt : undefined);
             if (typeof tgt === 'string') tgt = { text: tgt };
-            // If only a pattern was provided, assert that some element with that text is visible
             if (!tgt && pat) {
               log(`STEP ${n}: assertText (page) ~ ${pat}`);
               await page.getByText(asRegex(pat)).waitFor({ state: 'visible', timeout: 10000 });
               break;
             }
-            // If neither present, fail
             if (!tgt) throw new Error('assertText needs a target or pattern/text');
             if (!pat) pat = tgt.text || tgt.label || '';
             log(`STEP ${n}: assertText ${JSON.stringify(tgt)} ~ ${pat}`);
@@ -172,26 +162,21 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
             if (!asRegex(pat).test(txt)) throw new Error(`assertText failed: got "${txt}", expected ${pat}`);
             break;
           }
-
           case 'assertVisible': {
-            // Allow string target
             const tgt = typeof s.target === 'string' ? { text: s.target } : s.target;
             log(`STEP ${n}: assertVisible ${JSON.stringify(tgt)}`);
             await (await locatorFor(page, tgt)).waitFor({ state: 'visible', timeout: 10000 });
             break;
           }
-
           case 'assertUrl': {
             const url = page.url();
             log(`STEP ${n}: assertUrl ~ ${s.pattern} on ${url}`);
             if (!asRegex(s.pattern).test(url)) throw new Error(`assertUrl failed: "${url}" !~ ${s.pattern}`);
             break;
           }
-
           case 'screenshot':
             log(`STEP ${n}: screenshot`);
             break;
-
           default:
             throw new Error(`Unknown step: ${s.step}`);
         }
@@ -203,18 +188,26 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
         try { await page.screenshot({ path: snap, fullPage: false }); } catch {}
         results.push({ ...s, status, error, screenshot: path.basename(snap) });
         if (status === 'ok') passed += 1;
-        if (status === 'error') break; // stop on first failure
+        if (status === 'error') break;
       }
     }
   } finally {
+    // write log
     try { await fsp.writeFile(path.join(outDir, 'run.log'), logLines.join('\n')); } catch {}
-    // save video
-    try {
-      const v = await (await context.pages())[0]?.video?.();
-      if (v) await v.saveAs(path.join(outDir, 'run.webm'));
-    } catch {}
-    await context.close();
-    await browser.close();
+
+    // fetch video handle before closing
+    let videoHandle = null;
+    try { videoHandle = (await context.pages())[0]?.video?.(); } catch {}
+
+    // close context/browser quickly
+    try { await context.close(); } catch {}
+    try { await browser.close(); } catch {}
+
+    // save video, but DO NOT BLOCK the response (race with 3s timeout)
+    if (videoHandle) {
+      const save = (async () => { try { await videoHandle.saveAs(path.join(outDir, 'run.webm')); } catch {} })();
+      await Promise.race([save, new Promise(r => setTimeout(r, 3000))]);
+    }
   }
 
   return {
