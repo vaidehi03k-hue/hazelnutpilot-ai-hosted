@@ -1,5 +1,6 @@
-// ui/src/api.js
-export const API_BASE = import.meta.env.VITE_API_HOST || "http://localhost:4000";
+// src/api.js
+export const API_BASE =
+  import.meta.env.VITE_API_HOST?.replace(/\/+$/, "") || "http://localhost:4000";
 
 export async function apiGet(path) {
   const r = await fetch(`${API_BASE}${path}`);
@@ -30,3 +31,7 @@ export async function apiUpload(path, { file, extra = {} } = {}) {
   if (!r.ok || j?.ok === false) throw new Error(j?.error || r.statusText);
   return j;
 }
+
+// 🔧 Default export shim so older code can `import api from "../api"`
+const api = { API_BASE, apiGet, apiPost, apiUpload };
+export default api;
