@@ -4,7 +4,9 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "dev": "node index.js"
+    "dev": "node index.js",
+    "start": "node index.js",
+    "postinstall": "npx playwright install --with-deps || npx playwright install"
   },
   "dependencies": {
     "@playwright/test": "1.55.0",
