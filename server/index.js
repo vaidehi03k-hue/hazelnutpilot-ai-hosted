@@ -5,11 +5,15 @@ import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import fs from 'fs';
 import multer from 'multer';
-// ❌ DUPLICATE REMOVED: import path from 'path';
-import pdf from 'pdf-parse';
+// import pdf from 'pdf-parse';
 import mammoth from 'mammoth';
 import { runWebTests } from './runWebTests.js';
 import { generateTestsFromPrd } from './ai.js';
+
+// ✅ load pdf-parse via CommonJS to avoid the ENOENT test-file bug
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const pdf = require('pdf-parse');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -50,8 +54,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve run artifacts (screenshots/videos/logs)
-app.use('/runs', express.static(path.join(process.cwd(), 'runs')));
+// Ensure runs dir exists and serve artifacts (screenshots/videos/logs)
+const RUNS_DIR = path.join(process.cwd(), 'runs');
+try { fs.mkdirSync(RUNS_DIR, { recursive: true }); } catch {}
+app.use('/runs', express.static(RUNS_DIR));
 
 // Friendly health & root
 app.get('/', (_req, res) => res.type('text').send('HazelnutPilot AI API is live. See /api/health /api/summary'));
@@ -93,7 +99,6 @@ app.get('/api/projects/:id', (req, res) => {
   if (!p) return res.status(404).json({ ok: false, error: 'project not found' });
   res.json({ ok: true, project: p });
 });
-
 
 // --------- Update Base URL ----------
 app.post('/api/projects/:id/base-url', (req, res) => {
