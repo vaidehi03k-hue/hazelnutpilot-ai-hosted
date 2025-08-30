@@ -1,4 +1,4 @@
-// ui/src/pages/Dashboard.jsx
+// src/pages/Dashboard.jsx
 import React from "react";
 import { API_BASE, apiGet, apiPost } from "../api";
 
@@ -15,8 +15,8 @@ export default function Dashboard() {
     let off = false;
     (async () => {
       try {
-        setErr("");
         setLoading(true);
+        setErr("");
         const j = await apiGet("/api/projects");
         if (!off) setProjects(j.projects || []);
       } catch (e) {
@@ -37,16 +37,18 @@ export default function Dashboard() {
     try {
       setCreating(true);
       setErr("");
-      // server requires { name }, baseUrl is optional
-      const j = await apiPost("/api/projects", { name: name.trim(), baseUrl: baseUrl.trim() });
-      const p = j.project;
+      const payload = { name: name.trim(), baseUrl: baseUrl.trim() };
+      console.log("[create] POST", `${API_BASE}/api/projects`, payload);
+      const j = await apiPost("/api/projects", payload);
+      const p = j?.project;
       if (!p?.id) throw new Error("API did not return a project id");
-      // optional: refresh list
+      // optimistic add
       setProjects(prev => [p, ...prev]);
-      // redirect to the project page (your Project.jsx reads /project/<id> or ?id=)
+      // ✅ use query param to avoid Vercel 404s
       window.location.href = `/project?id=${p.id}`;
     } catch (e) {
       setErr(String(e?.message || e));
+      console.error("[create] error:", e);
     } finally {
       setCreating(false);
     }
@@ -59,14 +61,12 @@ export default function Dashboard() {
         <code className="text-xs text-gray-500">API: {API_BASE}</code>
       </header>
 
-      {/* Error banner */}
       {err && (
         <div className="rounded border border-red-200 bg-red-50 text-red-800 p-3 text-sm">
           {err}
         </div>
       )}
 
-      {/* Create new project */}
       <form onSubmit={createProject} className="rounded border p-4 bg-white space-y-3">
         <div className="text-lg font-semibold">New Project</div>
         <div className="grid md:grid-cols-2 gap-3">
@@ -98,7 +98,6 @@ export default function Dashboard() {
         </button>
       </form>
 
-      {/* Project list */}
       <section className="space-y-2">
         <div className="text-lg font-semibold">All Projects</div>
         {loading ? (
@@ -123,12 +122,7 @@ export default function Dashboard() {
                     <td className="px-3 py-2">{p.name}</td>
                     <td className="px-3 py-2">
                       {p.baseUrl ? (
-                        <a
-                          className="underline text-blue-600"
-                          href={p.baseUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
+                        <a className="underline text-blue-600" href={p.baseUrl} target="_blank" rel="noreferrer">
                           {p.baseUrl}
                         </a>
                       ) : (
@@ -140,10 +134,7 @@ export default function Dashboard() {
                       {p.lastRunAt ? new Date(p.lastRunAt).toLocaleString() : "—"}
                     </td>
                     <td className="px-3 py-2">
-                      <a
-                        className="px-3 py-1.5 rounded bg-green-600 text-white hover:bg-green-700"
-                        href={`/project/${p.id}`}
-                      >
+                      <a className="px-3 py-1.5 rounded bg-green-600 text-white hover:bg-green-700" href={`/project?id=${p.id}`}>
                         Open
                       </a>
                     </td>

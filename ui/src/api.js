@@ -32,6 +32,6 @@ export async function apiUpload(path, { file, extra = {} } = {}) {
   return j;
 }
 
-// Default export shim so legacy `import api from "../api"` still works
+// default export shim so `import api from "../api"` still works
 const api = { API_BASE, apiGet, apiPost, apiUpload };
 export default api;
