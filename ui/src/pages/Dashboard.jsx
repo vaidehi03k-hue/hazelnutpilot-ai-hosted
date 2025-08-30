@@ -1,70 +1,159 @@
-import React, { useEffect, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import api from '../api'
-import UICard from '../components/UICard'
+// ui/src/pages/Dashboard.jsx
+import React from "react";
+import { API_BASE, apiGet, apiPost } from "../api";
 
-export default function Dashboard(){
-  const [summary, setSummary] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [projects, setProjects] = useState([])
-  const navigate = useNavigate()
+export default function Dashboard() {
+  const [projects, setProjects] = React.useState([]);
+  const [loading, setLoading] = React.useState(true);
+  const [err, setErr] = React.useState("");
 
-  async function loadAll() {
-    const s = await api.get('/summary')
-    const p = await api.get('/projects')
-    setSummary(s.data)
-    setProjects(p.data?.projects || [])
-  }
+  const [name, setName] = React.useState("");
+  const [baseUrl, setBaseUrl] = React.useState("");
+  const [creating, setCreating] = React.useState(false);
 
-  useEffect(()=>{ (async()=>{ 
-    try { await loadAll() } finally { setLoading(false) }
-  })() },[])
+  React.useEffect(() => {
+    let off = false;
+    (async () => {
+      try {
+        setErr("");
+        setLoading(true);
+        const j = await apiGet("/api/projects");
+        if (!off) setProjects(j.projects || []);
+      } catch (e) {
+        if (!off) setErr(String(e?.message || e));
+      } finally {
+        if (!off) setLoading(false);
+      }
+    })();
+    return () => { off = true; };
+  }, []);
 
-  async function createProject(){
-    const name = prompt('Project name?') || 'My Project'
-    const r = await api.post('/projects', { name })
-    const id = r.data?.project?.id
-    if (!id) { alert('Failed to create project'); return }
-    navigate('/project/' + id)
-  }
-
-  if (loading) {
-    return <div className="p-6">Loading…</div>
+  async function createProject(e) {
+    e?.preventDefault?.();
+    if (!name.trim()) {
+      setErr("Please enter a project name.");
+      return;
+    }
+    try {
+      setCreating(true);
+      setErr("");
+      // server requires { name }, baseUrl is optional
+      const j = await apiPost("/api/projects", { name: name.trim(), baseUrl: baseUrl.trim() });
+      const p = j.project;
+      if (!p?.id) throw new Error("API did not return a project id");
+      // optional: refresh list
+      setProjects(prev => [p, ...prev]);
+      // redirect to the project page (your Project.jsx reads /project/<id> or ?id=)
+      window.location.href = `/project/${p.id}`;
+    } catch (e) {
+      setErr(String(e?.message || e));
+    } finally {
+      setCreating(false);
+    }
   }
 
   return (
-    <div className="space-y-6 p-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Dashboard</h1>
-        <button onClick={createProject} className="rounded-xl bg-indigo-600 px-4 py-2 text-white hover:bg-indigo-500 shadow">+ New Project</button>
-      </div>
+    <div className="max-w-5xl mx-auto p-6 space-y-8">
+      <header className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Projects</h1>
+        <code className="text-xs text-gray-500">API: {API_BASE}</code>
+      </header>
 
-      <div className="grid md:grid-cols-3 gap-4">
-        <UICard title="Projects" value={summary?.totals?.projects ?? '-'} />
-        <UICard title="Total Runs" value={summary?.totals?.runs ?? '-'} />
-        <UICard title="Pass Rate" value={summary?.totals?.passRate ?? '-'} />
-      </div>
+      {/* Error banner */}
+      {err && (
+        <div className="rounded border border-red-200 bg-red-50 text-red-800 p-3 text-sm">
+          {err}
+        </div>
+      )}
 
-      <div>
-        <h2 className="text-lg font-semibold mb-2">Projects</h2>
-        {projects.length === 0 ? (
-          <div className="text-slate-600">No projects yet. Click “New Project”.</div>
+      {/* Create new project */}
+      <form onSubmit={createProject} className="rounded border p-4 bg-white space-y-3">
+        <div className="text-lg font-semibold">New Project</div>
+        <div className="grid md:grid-cols-2 gap-3">
+          <div>
+            <label className="block text-sm mb-1">Name *</label>
+            <input
+              className="w-full border rounded px-3 py-2"
+              placeholder="e.g. Internet Demo"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-sm mb-1">Base URL (optional)</label>
+            <input
+              className="w-full border rounded px-3 py-2"
+              placeholder="https://the-internet.herokuapp.com"
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+            />
+          </div>
+        </div>
+        <button
+          type="submit"
+          disabled={creating}
+          className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700"
+        >
+          {creating ? "Creating…" : "Create Project"}
+        </button>
+      </form>
+
+      {/* Project list */}
+      <section className="space-y-2">
+        <div className="text-lg font-semibold">All Projects</div>
+        {loading ? (
+          <div className="text-sm text-gray-500">Loading…</div>
+        ) : projects.length === 0 ? (
+          <div className="text-sm text-gray-500">No projects yet.</div>
         ) : (
-          <ul className="grid gap-3">
-            {projects.map(p => (
-              <li key={p.id} className="flex items-center justify-between rounded-xl border p-4">
-                <div>
-                  <Link to={'/project/' + p.id} className="font-medium hover:underline">{p.name}</Link>
-                  {p.baseUrl ? <div className="text-xs text-slate-600">Base URL: <code>{p.baseUrl}</code></div> : null}
-                </div>
-                <div className="text-sm">
-                  <Link to={'/project/' + p.id} className="text-indigo-700 hover:underline">Open →</Link>
-                </div>
-              </li>
-            ))}
-          </ul>
+          <div className="border rounded overflow-hidden">
+            <table className="min-w-full text-sm">
+              <thead>
+                <tr className="text-left border-b bg-gray-50">
+                  <th className="px-3 py-2">Name</th>
+                  <th className="px-3 py-2">Base URL</th>
+                  <th className="px-3 py-2">Runs</th>
+                  <th className="px-3 py-2">Last Run</th>
+                  <th className="px-3 py-2">Open</th>
+                </tr>
+              </thead>
+              <tbody>
+                {projects.map((p) => (
+                  <tr key={p.id} className="border-b">
+                    <td className="px-3 py-2">{p.name}</td>
+                    <td className="px-3 py-2">
+                      {p.baseUrl ? (
+                        <a
+                          className="underline text-blue-600"
+                          href={p.baseUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {p.baseUrl}
+                        </a>
+                      ) : (
+                        <span className="text-gray-400">—</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2">{p.runs ?? 0}</td>
+                    <td className="px-3 py-2">
+                      {p.lastRunAt ? new Date(p.lastRunAt).toLocaleString() : "—"}
+                    </td>
+                    <td className="px-3 py-2">
+                      <a
+                        className="px-3 py-1.5 rounded bg-green-600 text-white hover:bg-green-700"
+                        href={`/project/${p.id}`}
+                      >
+                        Open
+                      </a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
-      </div>
+      </section>
     </div>
-  )
+  );
 }
