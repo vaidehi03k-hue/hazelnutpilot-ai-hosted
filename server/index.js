@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import fs from 'fs';
 import multer from 'multer';
-import path from 'path';
+// ❌ DUPLICATE REMOVED: import path from 'path';
 import pdf from 'pdf-parse';
 import mammoth from 'mammoth';
 import { runWebTests } from './runWebTests.js';
@@ -109,6 +109,7 @@ app.post('/api/projects/:id/base-url', (req, res) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
 // --------- PRD Upload + AI Generation ----------
 // Accepts multipart file upload OR JSON with { prdText, baseUrl }
 const upload = multer({ storage: multer.memoryStorage() });
@@ -119,28 +120,27 @@ app.post('/api/projects/:id/upload-prd', upload.single('file'), async (req, res)
     const p = db.projects.find(x => x.id === req.params.id);
     if (!p) return res.status(404).json({ ok: false, error: 'project not found' });
 
-    
-// Get PRD text either from uploaded file or JSON
-let prdText = '';
-if (req.file && req.file.buffer) {
-  const ext = (req.file.originalname || '').toLowerCase();
-  try {
-    if (ext.endsWith('.pdf')) {
-      const data = await pdf(req.file.buffer);
-      prdText = data.text || '';
-    } else if (ext.endsWith('.docx')) {
-      const r = await mammoth.extractRawText({ buffer: req.file.buffer });
-      prdText = r.value || '';
+    // Get PRD text either from uploaded file or JSON
+    let prdText = '';
+    if (req.file && req.file.buffer) {
+      const ext = (req.file.originalname || '').toLowerCase();
+      try {
+        if (ext.endsWith('.pdf')) {
+          const data = await pdf(req.file.buffer);
+          prdText = data.text || '';
+        } else if (ext.endsWith('.docx')) {
+          const r = await mammoth.extractRawText({ buffer: req.file.buffer });
+          prdText = r.value || '';
+        } else {
+          prdText = req.file.buffer.toString('utf8');
+        }
+      } catch (e) {
+        prdText = req.file.buffer.toString('utf8');
+      }
     } else {
-      prdText = req.file.buffer.toString('utf8');
+      prdText = req.body?.prdText || req.body?.text || '';
     }
-  } catch (e) {
-    prdText = req.file.buffer.toString('utf8');
-  }
-} else {
-  prdText = req.body?.prdText || req.body?.text || '';
-}
-if (!prdText.trim()) return res.status(400).json({ ok: false, error: 'prdText or file required' });
+    if (!prdText.trim()) return res.status(400).json({ ok: false, error: 'prdText or file required' });
 
     // Base URL preference: request > existing project
     const baseUrl = req.body?.baseUrl || p.baseUrl || '';
