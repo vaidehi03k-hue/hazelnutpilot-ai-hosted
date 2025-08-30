@@ -1,56 +1,269 @@
 // server/index.js
-import express from "express";
-import cors from "cors";
-import morgan from "morgan";
-import path from "path";
-import { fileURLToPath } from "url";
+import express from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import crypto from 'crypto';
+import fs from 'fs';
+import multer from 'multer';
+import path from 'path';
+import pdf from 'pdf-parse';
+import mammoth from 'mammoth';
+import { runWebTests } from './runWebTests.js';
+import { generateTestsFromPrd } from './ai.js';
 
-// --- Route modules (keep your existing projects router) ---
-import { projectsRouter } from "./routes/projects.js"; // your existing CRUD for /api/projects
-import { prdRouter } from "./routes/prd.js";           // PRD upload -> AI -> plan.json
-import { testsRouter } from "./routes/tests.js";       // Run plan -> video/screenshots/results
-
-// Resolve __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// --------- tiny file-backed DB ----------
+const DATA_DIR = path.join(process.cwd(), 'data');
+const DB_FILE  = path.join(DATA_DIR, 'db.json');
+
+function ensureData() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(DB_FILE)) {
+    fs.writeFileSync(DB_FILE, JSON.stringify({ projects: [] }, null, 2));
+  }
+}
+function loadDB() {
+  ensureData();
+  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+  catch { return { projects: [] }; }
+}
+function saveDB(db) {
+  ensureData();
+  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+}
+
+// --------- app ----------
 const app = express();
+app.use(express.json({ limit: '4mb' }));
 
-// --- Core middleware ---
-app.use(cors());
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
-app.use(morgan("dev"));
+// allow raw text for certain routes (optional)
+app.use('/api/projects/:id/upload-prd-text', express.text({ type: 'text/*', limit: '2mb' }));
 
-// --- Static artifact hosting ---
-app.use("/artifacts", express.static(path.join(process.cwd(), "artifacts")));
-app.use("/plans", express.static(path.join(process.cwd(), "plans")));
-
-// --- Health check ---
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, status: "healthy", time: new Date().toISOString() });
+// CORS (Vercel UI -> Render API)
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*'); // tighten to your Vercel origin if you want
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
 });
 
-// --- API routes ---
-app.use("/api", projectsRouter); // must include: GET /projects, POST /projects, GET/PUT /projects/:id, etc.
-app.use("/api", prdRouter);      // POST /projects/:projectId/prd, GET /projects/:projectId/plans, GET /plans/:planId
-app.use("/api", testsRouter);    // POST /plans/:planId/run, GET /jobs/:jobId
+// Serve run artifacts (screenshots/videos/logs)
+app.use('/runs', express.static(path.join(process.cwd(), 'runs')));
 
-// --- Not found handler (API only) ---
-app.use("/api", (_req, res) => {
-  res.status(404).json({ ok: false, error: "Not found" });
+// Friendly health & root
+app.get('/', (_req, res) => res.type('text').send('HazelnutPilot AI API is live. See /api/health /api/summary'));
+app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'hazelnutpilot-ai', time: new Date().toISOString() }));
+
+// --------- Projects ----------
+app.get('/api/projects', (_req, res) => {
+  const db = loadDB();
+  res.json({
+    ok: true,
+    projects: db.projects.map(p => ({
+      id: p.id, name: p.name, baseUrl: p.baseUrl,
+      runs: p.runs?.length || 0, lastRunAt: p.lastRunAt || null
+    }))
+  });
 });
 
-// --- Generic error handler ---
-app.use((err, _req, res, _next) => {
-  console.error(err);
-  res.status(500).json({ ok: false, error: "Internal Server Error" });
+app.post('/api/projects', (req, res) => {
+  const { name, baseUrl } = req.body || {};
+  if (!name) return res.status(400).json({ ok: false, error: 'name required' });
+
+  const db = loadDB();
+  const id = crypto.randomUUID?.() || String(Date.now());
+
+  const project = {
+    id, name, baseUrl: baseUrl || '',
+    createdAt: new Date().toISOString(),
+    lastPrdText: '', lastGeneratedSteps: [], runs: []
+  };
+
+  db.projects.unshift(project);
+  saveDB(db);
+  res.json({ ok: true, project });   // <-- important: project.id is here
 });
 
-// --- Server bootstrap ---
-const PORT = process.env.PORT || 4000;
-const HOST = process.env.HOST || "0.0.0.0";
-
-app.listen(PORT, HOST, () => {
-  console.log(`API listening on http://${HOST}:${PORT}`);
+app.get('/api/projects/:id', (req, res) => {
+  const db = loadDB();
+  const p = db.projects.find(x => x.id === req.params.id);
+  if (!p) return res.status(404).json({ ok: false, error: 'project not found' });
+  res.json({ ok: true, project: p });
 });
+
+
+// --------- Update Base URL ----------
+app.post('/api/projects/:id/base-url', (req, res) => {
+  try {
+    const db = loadDB();
+    const p = db.projects.find(x => x.id === req.params.id);
+    if (!p) return res.status(404).json({ ok: false, error: 'project not found' });
+    const baseUrl = req.body?.baseUrl || '';
+    p.baseUrl = baseUrl;
+    saveDB(db);
+    res.json({ ok: true, project: p });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+// --------- PRD Upload + AI Generation ----------
+// Accepts multipart file upload OR JSON with { prdText, baseUrl }
+const upload = multer({ storage: multer.memoryStorage() });
+
+app.post('/api/projects/:id/upload-prd', upload.single('file'), async (req, res) => {
+  try {
+    const db = loadDB();
+    const p = db.projects.find(x => x.id === req.params.id);
+    if (!p) return res.status(404).json({ ok: false, error: 'project not found' });
+
+    
+// Get PRD text either from uploaded file or JSON
+let prdText = '';
+if (req.file && req.file.buffer) {
+  const ext = (req.file.originalname || '').toLowerCase();
+  try {
+    if (ext.endsWith('.pdf')) {
+      const data = await pdf(req.file.buffer);
+      prdText = data.text || '';
+    } else if (ext.endsWith('.docx')) {
+      const r = await mammoth.extractRawText({ buffer: req.file.buffer });
+      prdText = r.value || '';
+    } else {
+      prdText = req.file.buffer.toString('utf8');
+    }
+  } catch (e) {
+    prdText = req.file.buffer.toString('utf8');
+  }
+} else {
+  prdText = req.body?.prdText || req.body?.text || '';
+}
+if (!prdText.trim()) return res.status(400).json({ ok: false, error: 'prdText or file required' });
+
+    // Base URL preference: request > existing project
+    const baseUrl = req.body?.baseUrl || p.baseUrl || '';
+
+    // Generate steps with AI
+    const steps = await generateTestsFromPrd({ baseUrl, prdText });
+
+    // Persist PRD + steps
+    p.lastPrdText = prdText;
+    p.baseUrl = baseUrl || p.baseUrl;
+    p.lastGeneratedSteps = steps;
+    saveDB(db);
+
+    res.json({ ok: true, projectId: p.id, baseUrl: p.baseUrl, steps });
+  } catch (e) {
+    console.error('upload-prd error:', e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Optional: raw text upload (Content-Type: text/plain)
+app.post('/api/projects/:id/upload-prd-text', async (req, res) => {
+  try {
+    const db = loadDB();
+    const p = db.projects.find(x => x.id === req.params.id);
+    if (!p) return res.status(404).json({ ok: false, error: 'project not found' });
+    const prdText = String(req.body || '').trim();
+    if (!prdText) return res.status(400).json({ ok: false, error: 'text body required' });
+
+    const baseUrl = p.baseUrl || '';
+    const steps = await generateTestsFromPrd({ baseUrl, prdText });
+    p.lastPrdText = prdText;
+    p.lastGeneratedSteps = steps;
+    saveDB(db);
+    res.json({ ok: true, projectId: p.id, baseUrl: p.baseUrl, steps });
+  } catch (e) {
+    console.error('upload-prd-text error:', e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Fetch last generated steps
+app.get('/api/projects/:id/steps', (req, res) => {
+  const db = loadDB();
+  const p = db.projects.find(x => x.id === req.params.id);
+  if (!p) return res.status(404).json({ ok: false, error: 'project not found' });
+  res.json({ ok: true, steps: p.lastGeneratedSteps || [] });
+});
+
+// --------- Run Web Tests ----------
+// Accepts { steps?, baseUrl? }. If steps missing, uses project's lastGeneratedSteps.
+app.post('/api/projects/:id/run-web', async (req, res) => {
+  try {
+    const db = loadDB();
+    const p = db.projects.find(x => x.id === req.params.id) || null;
+
+    let steps = req.body?.steps ?? (p?.lastGeneratedSteps || []);
+    if (typeof steps === 'string') {
+      try { steps = JSON.parse(steps); } catch {}
+    }
+    if (!Array.isArray(steps) || steps.length === 0) {
+      return res.status(400).json({ ok: false, error: '"steps" must be a non-empty array' });
+    }
+
+    const baseUrl =
+      req.body?.baseUrl ||
+      (steps[0]?.step === 'goto' ? steps[0]?.target : '') ||
+      (p?.baseUrl || '');
+
+    const runId = crypto.randomUUID?.() || String(Date.now());
+    const report = await runWebTests({ steps, baseUrl, runId });
+
+    if (p) {
+      p.runs = p.runs || [];
+      p.runs.unshift({
+        id: runId,
+        at: new Date().toISOString(),
+        baseUrl,
+        summary: report.summary,
+        results: report.results
+      });
+      p.lastRunAt = p.runs[0].at;
+      saveDB(db);
+    }
+
+    res.json({ ok: true, runId, report });
+  } catch (e) {
+    console.error('run-web error:', e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// List runs (for Run History table)
+app.get('/api/projects/:id/runs', (req, res) => {
+  const db = loadDB();
+  const p = db.projects.find(x => x.id === req.params.id);
+  if (!p) return res.status(404).json({ ok: false, error: 'project not found' });
+  res.json({ ok: true, runs: p.runs || [] });
+});
+
+// Dashboard summary (also used for Health check)
+app.get('/api/summary', (_req, res) => {
+  const db = loadDB();
+  const projects = db.projects || [];
+  const runs = projects.reduce((n, p) => n + (p.runs?.length || 0), 0);
+  const passed = projects.reduce((n, p) => n + (p.runs?.reduce((m, r) => m + (r.summary?.passed || 0), 0) || 0), 0);
+  const total = projects.reduce((n, p) => n + (p.runs?.reduce((m, r) => m + (r.summary?.total || 0), 0) || 0), 0);
+  const passRate = total ? Math.round((passed / total) * 100) : 0;
+
+  res.json({
+    totals: { projects: projects.length, runs, passRate },
+    projects: projects.map(p => ({
+      id: p.id, name: p.name, baseUrl: p.baseUrl,
+      runs: p.runs?.length || 0, lastRunAt: p.lastRunAt || null
+    }))
+  });
+});
+
+// --------- start ----------
+const PORT = Number(process.env.PORT) || 4000;
+app.listen(PORT, () => {
+  console.log('✅ Runner build: dynamic DOM + retries + video + screenshots');
+  console.log(`API listening on :${PORT}`);
+});
+
+export default app;
