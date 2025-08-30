@@ -3,20 +3,19 @@ import React from "react";
 import { API_BASE, apiGet, apiPost } from "../api";
 
 export default function Dashboard() {
-  const [projects, setProjects] = React.useState([]);
   const [totals, setTotals] = React.useState({ projects: 0, runs: 0, passRate: 0 });
+  const [projects, setProjects] = React.useState([]);
   const [loading, setLoading] = React.useState(true);
   const [err, setErr] = React.useState("");
 
-  // load summary + projects (matches your original dashboard)
   React.useEffect(() => {
     let off = false;
     (async () => {
       try {
-        setLoading(true);
         setErr("");
-        const s = await apiGet("/api/summary");   // { totals: {projects,runs,passRate}, projects:[...] }
-        const p = await apiGet("/api/projects");  // { ok:true, projects:[...] }
+        setLoading(true);
+        const s = await apiGet("/api/summary");   // { totals, projects }
+        const p = await apiGet("/api/projects");  // { ok:true, projects }
         if (off) return;
         setTotals(s?.totals || { projects: 0, runs: 0, passRate: 0 });
         setProjects(Array.isArray(p?.projects) ? p.projects : []);
@@ -29,47 +28,50 @@ export default function Dashboard() {
     return () => { off = true; };
   }, []);
 
-  async function createViaPrompt() {
+  async function onNewProject() {
     const name = window.prompt("Project name?")?.trim();
     if (!name) return;
     const baseUrl = window.prompt("Base URL (optional)?")?.trim() || "";
 
     try {
-      const j = await apiPost("/api/projects", { name, baseUrl }); // server requires { name }
+      setErr("");
+      // POST to server exactly as before
+      const j = await apiPost("/api/projects", { name, baseUrl });
       const id = j?.project?.id;
-      if (!id) throw new Error("API did not return a project id");
-      // navigate exactly like your old UI did (pretty path)
-      window.location.href = `/project/${id}`;
+      if (!id) throw new Error("API didn't return project id");
+
+      // Optimistically add to list
+      setProjects(prev => [j.project, ...prev]);
+
+      // Navigate to the project page.
+      // Use query param to avoid Vercel deep-link 404s. (Your existing Project.jsx reads ?id=)
+      window.location.href = `/project?id=${id}`;
     } catch (e) {
+      console.error("create failed:", e);
       alert("Create failed: " + (e?.message || e));
+      setErr(String(e?.message || e));
     }
   }
 
   return (
     <div className="p-6">
-      {/* top bar */}
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-serif font-bold">Dashboard</h1>
-        <button
-          onClick={createViaPrompt}
-          className="border px-3 py-1 rounded hover:bg-gray-50"
-          title="Create a new project"
-        >
+        <button className="border px-3 py-1 rounded hover:bg-gray-50" onClick={onNewProject}>
           + New Project
         </button>
       </div>
 
-      {/* tiny debug line to confirm API host being used */}
+      {/* tiny debug so you can verify the API origin quickly */}
       <div style={{ fontSize: 12, color: "#666", marginTop: 6 }}>API: {API_BASE}</div>
 
-      {/* error banner */}
       {err && (
         <div className="mt-3 text-sm text-red-700 border border-red-200 bg-red-50 rounded p-3">
           {err}
         </div>
       )}
 
-      {/* summary table – visually similar to your old one */}
+      {/* summary blocks (simple like your original) */}
       <div className="mt-6 border">
         <div className="border-b px-2 py-1">Projects</div>
         <div className="px-2 py-1">{totals.projects}</div>
@@ -83,7 +85,6 @@ export default function Dashboard() {
         <div className="px-2 py-1">{totals.passRate}%</div>
       </div>
 
-      {/* project list (very close to your original table feel) */}
       <h2 className="mt-8 text-2xl font-serif font-semibold">Projects</h2>
       {loading ? (
         <div className="mt-2 text-sm text-gray-500">Loading…</div>
@@ -105,10 +106,7 @@ export default function Dashboard() {
                 ) : (
                   <span className="text-xs text-gray-400">no base URL</span>
                 )}
-                <a
-                  className="border px-2 py-1 rounded hover:bg-gray-50"
-                  href={`/project/${p.id}`}
-                >
+                <a className="border px-2 py-1 rounded hover:bg-gray-50" href={`/project?id=${p.id}`}>
                   Open
                 </a>
               </div>

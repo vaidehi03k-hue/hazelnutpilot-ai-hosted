@@ -1,4 +1,4 @@
-// src/api.js
+// ui/src/api.js
 export const API_BASE =
   import.meta.env.VITE_API_HOST?.replace(/\/+$/, "") || "http://localhost:4000";
 
@@ -32,6 +32,6 @@ export async function apiUpload(path, { file, extra = {} } = {}) {
   return j;
 }
 
-// default export shim so `import api from "../api"` still works
+// default export shim so old code `import api from "../api"` still works
 const api = { API_BASE, apiGet, apiPost, apiUpload };
 export default api;
