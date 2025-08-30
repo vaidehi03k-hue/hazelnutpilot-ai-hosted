@@ -34,8 +34,30 @@ async function locatorFor(page, t) {
   throw new Error('Unresolvable target: ' + JSON.stringify(t));
 }
 
+// Normalize step name & fields (accepts "expect*" and common synonyms)
+function normalizeStep(s) {
+  const aliases = {
+    navigate: 'goto', open: 'goto', go: 'goto',
+    type: 'fill', input: 'fill',
+    presskey: 'press', 'press-key': 'press',
+    selectoption: 'select', 'select-option': 'select',
+    checkbox: 'check', uncheckbox: 'uncheck',
+    waitfor: 'waitForVisible', 'waitforvisible': 'waitForVisible',
+    expecttext: 'assertText', expectvisible: 'assertVisible', expecturl: 'assertUrl'
+  };
+  const key = String(s.step || '').toLowerCase();
+  if (aliases[key]) s.step = aliases[key];
+
+  // Common field aliases
+  if (s.step === 'goto' && s.url && !s.target) s.target = s.url;
+  if (s.step === 'fill' && s.text != null && s.value == null) s.value = s.text;
+  if (s.regex && s.pattern == null) s.pattern = s.regex;
+
+  return s;
+}
+
 export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) {
-  // ✅ lazy-load Playwright so boot doesn't crash if devDeps are skipped
+  // lazy-load Playwright so boot doesn't crash if devDeps are skipped
   const { chromium } = await import('playwright');
 
   const outDir = path.join(process.cwd(), 'runs', runId);
@@ -77,7 +99,7 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
         break;
       }
 
-      const s = steps[i];
+      const s = normalizeStep({ ...steps[i] }); // 🔁 normalize aliases/fields
       const n = i + 1;
       const snap = path.join(outDir, `${String(n).padStart(2, '0')}.png`);
       let status = 'ok', error = null;
@@ -88,34 +110,42 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
             log(`STEP ${n}: goto ${joinUrl(baseUrl, s.target || '/')}`);
             await page.goto(joinUrl(baseUrl, s.target || '/'), { waitUntil: 'domcontentloaded', timeout: 20000 });
             break;
+
           case 'click':
             log(`STEP ${n}: click ${JSON.stringify(s.target)}`);
             await (await locatorFor(page, s.target)).click({ timeout: 10000 });
             break;
+
           case 'fill':
             log(`STEP ${n}: fill ${JSON.stringify(s.target)} value=${String(s.value ?? '')}`);
             await (await locatorFor(page, s.target)).fill(String(s.value ?? ''), { timeout: 10000 });
             break;
+
           case 'press':
             log(`STEP ${n}: press ${JSON.stringify(s.target)} key=${s.key || 'Enter'}`);
             await (await locatorFor(page, s.target)).press(String(s.key || 'Enter'), { timeout: 10000 });
             break;
+
           case 'select':
             log(`STEP ${n}: select ${JSON.stringify(s.target)} -> ${String(s.value)}`);
             await (await locatorFor(page, s.target)).selectOption(String(s.value), { timeout: 10000 });
             break;
+
           case 'check':
             log(`STEP ${n}: check ${JSON.stringify(s.target)}`);
             await (await locatorFor(page, s.target)).check({ timeout: 10000 });
             break;
+
           case 'uncheck':
             log(`STEP ${n}: uncheck ${JSON.stringify(s.target)}`);
             await (await locatorFor(page, s.target)).uncheck({ timeout: 10000 });
             break;
+
           case 'waitForVisible':
             log(`STEP ${n}: waitForVisible ${JSON.stringify(s.target)}`);
             await (await locatorFor(page, s.target)).waitFor({ state: 'visible', timeout: 10000 });
             break;
+
           case 'assertText': {
             log(`STEP ${n}: assertText ${JSON.stringify(s.target)} ~ ${s.pattern}`);
             const loc = await locatorFor(page, s.target);
@@ -124,19 +154,23 @@ export async function runWebTests({ steps, baseUrl, runId, maxRunMs = 120000 }) 
             if (!asRegex(s.pattern).test(txt)) throw new Error(`assertText failed: got "${txt}", expected ${s.pattern}`);
             break;
           }
+
           case 'assertVisible':
             log(`STEP ${n}: assertVisible ${JSON.stringify(s.target)}`);
             await (await locatorFor(page, s.target)).waitFor({ state: 'visible', timeout: 10000 });
             break;
+
           case 'assertUrl': {
             const url = page.url();
             log(`STEP ${n}: assertUrl ~ ${s.pattern} on ${url}`);
             if (!asRegex(s.pattern).test(url)) throw new Error(`assertUrl failed: "${url}" !~ ${s.pattern}`);
             break;
           }
+
           case 'screenshot':
             log(`STEP ${n}: screenshot`);
             break;
+
           default:
             throw new Error(`Unknown step: ${s.step}`);
         }
