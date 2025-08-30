@@ -6,16 +6,13 @@ import crypto from "crypto";
 import fs from "fs";
 import multer from "multer";
 
-// NOTE: do NOT static-import pdf-parse/mammoth to avoid odd init behavior on Render.
-// We'll lazy-load them only when needed inside the route.
-
 import { runWebTests } from "./runWebTests.js";
 import { generateTestsFromPrd } from "./ai.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ---------- tiny file-backed DB ----------
+// ---- tiny file-backed DB ----
 const DATA_DIR = path.join(process.cwd(), "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 
@@ -27,35 +24,32 @@ function ensureData() {
 }
 function loadDB() {
   ensureData();
-  try {
-    return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
-  } catch {
-    return { projects: [] };
-  }
+  try { return JSON.parse(fs.readFileSync(DB_FILE, "utf8")); }
+  catch { return { projects: [] }; }
 }
 function saveDB(db) {
   ensureData();
   fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
 
-// ---------- helpers ----------
+// ---- lazy parsers ----
 async function parsePdfBuffer(buf) {
-  const pdfParse = (await import("pdf-parse")).default; // lazy
+  const pdfParse = (await import("pdf-parse")).default;
   const data = await pdfParse(buf);
   return data.text || "";
 }
 async function parseDocxBuffer(buf) {
-  const mammoth = (await import("mammoth")); // lazy
+  const mammoth = (await import("mammoth"));
   const res = await mammoth.extractRawText({ buffer: buf });
   return res.value || "";
 }
 
-// ---------- app ----------
+// ---- app ----
 const app = express();
 
-// CORS (Vercel UI -> Render API)
+// CORS
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*"); // tighten to your UI origin if you want
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(200);
@@ -65,28 +59,21 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "4mb" }));
 app.use("/api/projects/:id/upload-prd-text", express.text({ type: "text/*", limit: "2mb" }));
 
-// Serve run artifacts (videos/screenshots/logs)
+// Serve artifacts
 app.use("/runs", express.static(path.join(process.cwd(), "runs")));
 
-// Basic health
-app.get("/", (_req, res) =>
-  res.type("text").send("HazelnutPilot AI API is live. See /api/health /api/summary")
-);
-app.get("/api/health", (_req, res) =>
-  res.json({ ok: true, service: "hazelnutpilot-ai", time: new Date().toISOString() })
-);
+// Health
+app.get("/", (_req, res) => res.type("text").send("HazelnutPilot AI API live."));
+app.get("/api/health", (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-// ---------- Projects ----------
+// ---- projects ----
 app.get("/api/projects", (_req, res) => {
   const db = loadDB();
   res.json({
     ok: true,
-    projects: db.projects.map((p) => ({
-      id: p.id,
-      name: p.name,
-      baseUrl: p.baseUrl,
-      runs: p.runs?.length || 0,
-      lastRunAt: p.lastRunAt || null,
+    projects: db.projects.map(p => ({
+      id: p.id, name: p.name, baseUrl: p.baseUrl,
+      runs: p.runs?.length || 0, lastRunAt: p.lastRunAt || null,
     })),
   });
 });
@@ -98,13 +85,9 @@ app.post("/api/projects", (req, res) => {
   const db = loadDB();
   const id = crypto.randomUUID?.() || String(Date.now());
   const project = {
-    id,
-    name,
-    baseUrl: baseUrl || "",
+    id, name, baseUrl: baseUrl || "",
     createdAt: new Date().toISOString(),
-    lastPrdText: "",
-    lastGeneratedSteps: [],
-    runs: [],
+    lastPrdText: "", lastGeneratedSteps: [], runs: [],
   };
   db.projects.unshift(project);
   saveDB(db);
@@ -113,7 +96,7 @@ app.post("/api/projects", (req, res) => {
 
 app.get("/api/projects/:id", (req, res) => {
   const db = loadDB();
-  const p = db.projects.find((x) => x.id === req.params.id);
+  const p = db.projects.find(x => x.id === req.params.id);
   if (!p) return res.status(404).json({ ok: false, error: "project not found" });
   res.json({ ok: true, project: p });
 });
@@ -121,7 +104,7 @@ app.get("/api/projects/:id", (req, res) => {
 app.post("/api/projects/:id/base-url", (req, res) => {
   try {
     const db = loadDB();
-    const p = db.projects.find((x) => x.id === req.params.id);
+    const p = db.projects.find(x => x.id === req.params.id);
     if (!p) return res.status(404).json({ ok: false, error: "project not found" });
     p.baseUrl = req.body?.baseUrl || "";
     saveDB(db);
@@ -131,26 +114,22 @@ app.post("/api/projects/:id/base-url", (req, res) => {
   }
 });
 
-// ---------- PRD Upload + AI ----------
+// ---- PRD upload + AI ----
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.post("/api/projects/:id/upload-prd", upload.single("file"), async (req, res) => {
   try {
     const db = loadDB();
-    const p = db.projects.find((x) => x.id === req.params.id);
+    const p = db.projects.find(x => x.id === req.params.id);
     if (!p) return res.status(404).json({ ok: false, error: "project not found" });
 
     let prdText = "";
     if (req.file && req.file.buffer) {
       const ext = (req.file.originalname || "").toLowerCase();
       try {
-        if (ext.endsWith(".pdf")) {
-          prdText = await parsePdfBuffer(req.file.buffer);
-        } else if (ext.endsWith(".docx")) {
-          prdText = await parseDocxBuffer(req.file.buffer);
-        } else {
-          prdText = req.file.buffer.toString("utf8");
-        }
+        if (ext.endsWith(".pdf")) prdText = await parsePdfBuffer(req.file.buffer);
+        else if (ext.endsWith(".docx")) prdText = await parseDocxBuffer(req.file.buffer);
+        else prdText = req.file.buffer.toString("utf8");
       } catch {
         prdText = req.file.buffer.toString("utf8");
       }
@@ -177,9 +156,8 @@ app.post("/api/projects/:id/upload-prd", upload.single("file"), async (req, res)
 app.post("/api/projects/:id/upload-prd-text", async (req, res) => {
   try {
     const db = loadDB();
-    const p = db.projects.find((x) => x.id === req.params.id);
+    const p = db.projects.find(x => x.id === req.params.id);
     if (!p) return res.status(404).json({ ok: false, error: "project not found" });
-
     const prdText = String(req.body || "").trim();
     if (!prdText) return res.status(400).json({ ok: false, error: "text body required" });
 
@@ -197,24 +175,21 @@ app.post("/api/projects/:id/upload-prd-text", async (req, res) => {
   }
 });
 
-// Last generated steps
 app.get("/api/projects/:id/steps", (req, res) => {
   const db = loadDB();
-  const p = db.projects.find((x) => x.id === req.params.id);
+  const p = db.projects.find(x => x.id === req.params.id);
   if (!p) return res.status(404).json({ ok: false, error: "project not found" });
   res.json({ ok: true, steps: p.lastGeneratedSteps || [] });
 });
 
-// ---------- Run Web Tests ----------
+// ---- run web tests ----
 app.post("/api/projects/:id/run-web", async (req, res) => {
   try {
     const db = loadDB();
-    const p = db.projects.find((x) => x.id === req.params.id) || null;
+    const p = db.projects.find(x => x.id === req.params.id) || null;
 
     let steps = req.body?.steps ?? (p?.lastGeneratedSteps || []);
-    if (typeof steps === "string") {
-      try { steps = JSON.parse(steps); } catch {}
-    }
+    if (typeof steps === "string") { try { steps = JSON.parse(steps); } catch {} }
     if (!Array.isArray(steps) || steps.length === 0) {
       return res.status(400).json({ ok: false, error: '"steps" must be a non-empty array' });
     }
@@ -251,42 +226,31 @@ app.post("/api/projects/:id/run-web", async (req, res) => {
   }
 });
 
-// Runs list
 app.get("/api/projects/:id/runs", (req, res) => {
   const db = loadDB();
-  const p = db.projects.find((x) => x.id === req.params.id);
+  const p = db.projects.find(x => x.id === req.params.id);
   if (!p) return res.status(404).json({ ok: false, error: "project not found" });
   res.json({ ok: true, runs: p.runs || [] });
 });
 
-// Dashboard summary
 app.get("/api/summary", (_req, res) => {
   const db = loadDB();
   const projects = db.projects || [];
   const runs = projects.reduce((n, p) => n + (p.runs?.length || 0), 0);
-  const passed = projects.reduce(
-    (n, p) => n + (p.runs?.reduce((m, r) => m + (r.summary?.passed || 0), 0) || 0),
-    0
-  );
-  const total = projects.reduce(
-    (n, p) => n + (p.runs?.reduce((m, r) => m + (r.summary?.total || 0), 0) || 0),
-    0
-  );
+  const passed = projects.reduce((n, p) => n + (p.runs?.reduce((m, r) => m + (r.summary?.passed || 0), 0) || 0), 0);
+  const total = projects.reduce((n, p) => n + (p.runs?.reduce((m, r) => m + (r.summary?.total || 0), 0) || 0), 0);
   const passRate = total ? Math.round((passed / total) * 100) : 0;
 
   res.json({
     totals: { projects: projects.length, runs, passRate },
-    projects: projects.map((p) => ({
-      id: p.id,
-      name: p.name,
-      baseUrl: p.baseUrl,
-      runs: p.runs?.length || 0,
-      lastRunAt: p.lastRunAt || null,
+    projects: projects.map(p => ({
+      id: p.id, name: p.name, baseUrl: p.baseUrl,
+      runs: p.runs?.length || 0, lastRunAt: p.lastRunAt || null,
     })),
   });
 });
 
-// ---------- start ----------
+// ---- start ----
 const PORT = Number(process.env.PORT) || 4000;
 app.listen(PORT, () => {
   console.log("✅ Runner build: dynamic DOM + retries + video + screenshots");
