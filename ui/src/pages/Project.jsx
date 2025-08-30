@@ -1,131 +1,178 @@
-import React, { useEffect, useState } from 'react'
-import { useParams, Link } from 'react-router-dom'
-import api from '../api'
+// ui/src/pages/Project.jsx
+import React from "react";
+import { API_BASE, apiGet, apiPost, apiUpload } from "../api";
+import RunArtifacts from "../components/RunArtifacts";
+import RunLinks from "../components/runLinks";
 
-export default function Project(){
-  const { id } = useParams()
-  const [project, setProject] = useState(null)
-  const [baseUrl, setBaseUrl] = useState('')
-  const [file, setFile] = useState(null)
-  const [genLoading, setGenLoading] = useState(false)
-  const [runLoading, setRunLoading] = useState(false)
-  const [runs, setRuns] = useState([])
 
-  async function fetchProject() {
-    const r = await api.get('/projects/' + id)
-    const p = r.data?.project || r.data
-    setProject(p || null)
-    setBaseUrl(p?.baseUrl || '')
-  }
 
-  async function fetchRuns() {
-    const r = await api.get('/projects/' + id + '/runs')
-    setRuns(r.data?.runs || [])
-  }
-
-  useEffect(()=>{ (async()=>{ 
-    await fetchProject()
-    await fetchRuns()
-  })() }, [id])
-
-  async function saveBase() {
-    await api.post('/projects/' + id + '/base-url', { baseUrl })
-    await fetchProject()
-  }
-
-  async function uploadPrdAndGenerate() {
+// read ?id=... from URL if not passed as prop
+function useProjectIdFromUrl(fallback) {
+  const [id, setId] = React.useState(fallback || "");
+  React.useEffect(() => {
+    if (fallback) return;
     try {
-      setGenLoading(true)
-      if (!file) return alert('Pick a PRD file first')
-      const fd = new FormData()
-      fd.append('file', file)
-      fd.append('baseUrl', baseUrl || '')
-      const r = await api.post('/projects/' + id + '/upload-prd', fd, { headers: { 'Content-Type': 'multipart/form-data' }})
-      if (!r.data?.ok) { alert('Generation failed'); return }
-      alert('Tests generated from PRD')
-      await fetchProject()
-    } finally { setGenLoading(false) }
-  }
+      const sp = new URLSearchParams(window.location.search);
+      const qid = sp.get("id") || "";
+      if (qid) setId(qid);
+    } catch {}
+  }, [fallback]);
+  return id || fallback || "";
+}
 
-  async function runWeb() {
+export default function Project(props) {
+  const projectId = useProjectIdFromUrl(props?.projectId);
+
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState("");
+  const [project, setProject] = React.useState(null);
+  const [baseUrl, setBaseUrl] = React.useState("");
+  const [steps, setSteps] = React.useState([]);
+  const [uploadBusy, setUploadBusy] = React.useState(false);
+  const [runBusy, setRunBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        setLoading(true);
+        setError("");
+        const j = await apiGet(`/api/projects/${projectId}`);
+        if (!cancelled) {
+          setProject(j.project);
+          setBaseUrl(j.project?.baseUrl || "");
+          setSteps(j.project?.lastGeneratedSteps || []);
+        }
+      } catch (e) {
+        if (!cancelled) setError(String(e?.message || e));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  async function saveBaseUrl() {
     try {
-      setRunLoading(true)
-      // If project has lastGeneratedSteps, server will use them automatically
-      const r = await api.post('/projects/' + id + '/run-web', { baseUrl })
-      if (!r.data?.ok) { alert('Run failed to start'); return }
-      // simple refresh of run history
-      setTimeout(fetchRuns, 1200)
-    } finally { setRunLoading(false) }
+      setError("");
+      await apiPost(`/api/projects/${projectId}/base-url`, { baseUrl });
+      const j = await apiGet(`/api/projects/${projectId}`);
+      setProject(j.project);
+    } catch (e) {
+      setError(String(e?.message || e));
+    }
   }
 
-  if (!project) return (
-    <div className="p-6">
-      <Link to="/" className="text-sm text-slate-600 hover:underline">← Back</Link>
-      <h1 className="mt-2 text-2xl font-semibold">Project not found</h1>
-    </div>
-  )
+  async function handleUploadFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      setUploadBusy(true);
+      setError("");
+      const j = await apiUpload(`/api/projects/${projectId}/upload-prd`, {
+        file,
+        extra: { baseUrl },
+      });
+      setSteps(j.steps || []);
+      const pj = await apiGet(`/api/projects/${projectId}`);
+      setProject(pj.project);
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setUploadBusy(false);
+      e.target.value = "";
+    }
+  }
+
+  async function handleRun() {
+    try {
+      setRunBusy(true);
+      setError("");
+      const payload = steps?.length ? { steps, baseUrl } : { baseUrl };
+      await apiPost(`/api/projects/${projectId}/run-web`, payload);
+      const pj = await apiGet(`/api/projects/${projectId}`);
+      setProject(pj.project);
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setRunBusy(false);
+    }
+  }
+
+  if (!projectId) return <div className="p-6 text-red-600">Missing project id (?id=…)</div>;
+  if (loading) return <div className="p-6 text-sm text-gray-500">Loading project…</div>;
+  if (error) return <div className="p-6 text-sm text-red-600">Error: {error}</div>;
+  if (!project) return <div className="p-6">Project not found.</div>;
 
   return (
-    <div className="p-6 space-y-8">
-      <div className="flex items-center justify-between">
+    <div className="max-w-5xl mx-auto p-6 space-y-8">
+      <header className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
         <div>
-          <Link to="/" className="text-sm text-slate-600 hover:underline">← Back</Link>
-          <h1 className="mt-2 text-2xl font-semibold">{project.name}</h1>
-          <div className="text-slate-600 text-sm">ID: {project.id}</div>
+          <div className="text-xl font-semibold">{project.name}</div>
+          <div className="text-xs text-gray-500 break-all">ID: {project.id}</div>
         </div>
-        <button onClick={runWeb} disabled={runLoading} className="rounded-lg border px-3 py-2 hover:bg-slate-50 disabled:opacity-50">
-          {runLoading ? 'Running…' : 'Run tests'}
-        </button>
-      </div>
+        <a
+          href={`${API_BASE}/api/summary`}
+          target="_blank"
+          rel="noreferrer"
+          className="text-sm underline text-blue-600"
+        >
+          API health/summary
+        </a>
+      </header>
 
-      <section className="rounded-xl border p-4 space-y-3">
-        <h2 className="text-lg font-medium">Base URL</h2>
+      <section className="space-y-2">
+        <label className="text-sm font-medium">Base URL</label>
         <div className="flex gap-2">
-          <input className="flex-1 rounded-lg border px-3 py-2" placeholder="https://example.com" value={baseUrl} onChange={e=>setBaseUrl(e.target.value)} />
-          <button className="rounded-lg bg-black text-white px-3 py-2" onClick={saveBase}>Save</button>
-          {project.baseUrl ? <a href={project.baseUrl} target="_blank" rel="noreferrer" className="text-slate-700 hover:underline px-3 py-2">Open</a> : null}
+          <input
+            className="border rounded px-3 py-2 w-full"
+            placeholder="https://example.com"
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+          />
+          <button
+            onClick={saveBaseUrl}
+            className="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700"
+          >
+            Save
+          </button>
         </div>
+        <div className="text-xs text-gray-500">Used by the test runner to resolve relative paths.</div>
       </section>
 
-      <section className="rounded-xl border p-4 space-y-3">
-        <h2 className="text-lg font-medium">Upload PRD → Generate Tests (AI)</h2>
-        <input type="file" accept=".pdf,.docx,.md,.txt" onChange={e=>setFile(e.target.files?.[0]||null)} />
-        <button onClick={uploadPrdAndGenerate} disabled={genLoading} className="rounded-lg border px-3 py-2 hover:bg-slate-50 disabled:opacity-50">
-          {genLoading ? 'Generating…' : 'Generate from PRD'}
-        </button>
-        <details className="bg-slate-50 rounded-lg p-3">
-          <summary className="cursor-pointer font-medium">Last generated steps (raw)</summary>
-          <pre className="text-xs overflow-auto">{JSON.stringify(project.lastGeneratedSteps || [], null, 2)}</pre>
-        </details>
+      <section className="space-y-2">
+        <label className="text-sm font-medium">Upload PRD (PDF / DOCX / TXT / MD)</label>
+        <input type="file" accept=".pdf,.docx,.txt,.md,.markdown" onChange={handleUploadFile} disabled={uploadBusy} />
+        {uploadBusy && <div className="text-xs text-gray-500">Uploading & generating tests…</div>}
       </section>
 
-      <section className="rounded-xl border p-4 space-y-3">
-        <h2 className="text-lg font-medium">Run History</h2>
-        {runs.length === 0 ? (
-          <div className="text-slate-600 text-sm">No runs yet.</div>
-        ) : (
-          <ul className="grid gap-3">
-            {runs.map((r, idx) => (
-              <li key={r.id || idx} className="rounded-lg border p-3">
-                <div className="flex items-center justify-between">
-                  <div className="font-medium">{new Date(r.at).toLocaleString()}</div>
-                  <div className={r.summary?.failed ? 'text-red-700' : 'text-green-700'}>
-                    {r.summary?.passed || 0} passed / {r.summary?.failed || 0} failed / {r.summary?.total || 0} total
-                  </div>
-                </div>
-                {r.artifacts?.video ? (
-                  <video src={r.artifacts.video} controls className="w-full rounded-lg border mt-2" />
-                ) : null}
-                <div className="grid grid-cols-2 gap-2 mt-2">
-                  {(r.artifacts?.screenshots || []).map((s, i) => (
-                    <img key={s+i} src={s} alt="step" className="w-full rounded border" />
-                  ))}
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
+      <section>
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold">Generated Steps</h2>
+          <button
+            onClick={handleRun}
+            disabled={runBusy}
+            className="px-4 py-2 rounded bg-green-600 text-white hover:bg-green-700"
+          >
+            {runBusy ? "Running…" : "Run Tests"}
+          </button>
+        </div>
+        <pre className="mt-3 text-xs bg-gray-50 border rounded p-3 overflow-auto max-h-80">
+          {JSON.stringify(steps, null, 2)}
+        </pre>
+      </section>
+
+      {/* Artifacts viewer with fail highlight + links */}
+      <section>
+        <h2 className="text-lg font-semibold mb-2">Latest Run</h2>
+        <RunArtifacts projectId={project.id} />
+      </section>
+
+      <section style={{ marginTop: 24 }}>
+        <h3 style={{ fontWeight: 600, marginBottom: 8 }}>Artifacts (latest run)</h3>
+        <RunLinks projectId={project.id}/>
       </section>
     </div>
-  )
+  );
 }
