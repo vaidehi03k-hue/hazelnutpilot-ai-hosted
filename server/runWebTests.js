@@ -2,78 +2,68 @@
 import * as path from 'node:path';
 import * as fsp from 'node:fs/promises';
 
-function isRegexString(s) {
-  return typeof s === 'string' && s.startsWith('/') && s.lastIndexOf('/') > 0;
-}
+function isRegexString(s) { return typeof s === 'string' && s.startsWith('/') && s.lastIndexOf('/') > 0; }
 function asRegex(pat) {
   if (!pat) return /.*/i;
   if (pat instanceof RegExp) return pat;
   if (isRegexString(pat)) {
-    const last = pat.lastIndexOf('/');
-    const body = pat.slice(1, last);
-    const flags = pat.slice(last + 1) || 'i';
+    const last = pat.lastIndexOf('/'); const body = pat.slice(1, last); const flags = pat.slice(last + 1) || 'i';
     try { return new RegExp(body, flags); } catch { return new RegExp(body, 'i'); }
   }
-  // plain string => fuzzy, case-insensitive
   const esc = String(pat).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(esc, 'i');
 }
 
-// When target is a string, treat it as a text locator by default
+// If target is a string, interpret as page text locator
 function normalizeTarget(t) {
   if (t == null) return null;
   if (typeof t === 'string') return { text: t };
-  if (typeof t === 'object') {
-    const out = { ...t };
-    if (typeof out.text === 'string') out.text = out.text;   // regex string allowed
-    if (typeof out.name === 'string') out.name = out.name;
-    if (typeof out.label === 'string') out.label = out.label;
-    return out;
-  }
-  return t;
+  return t && typeof t === 'object' ? { ...t } : t;
 }
 
 async function locatorFor(page, t) {
   const tgt = normalizeTarget(t);
   if (!tgt) throw new Error('Missing target');
 
-  // Role + name/label preferred
   if (tgt.role && (tgt.name || tgt.label)) {
     if (tgt.label) return page.getByRole(tgt.role, { name: asRegex(tgt.label) });
     if (tgt.name)  return page.getByRole(tgt.role, { name: asRegex(tgt.name) });
   }
-
-  // Accessible-friendly fallbacks
   if (tgt.label)       return page.getByLabel(asRegex(tgt.label));
   if (tgt.text)        return page.getByText(asRegex(tgt.text));
   if (tgt.placeholder) return page.getByPlaceholder(asRegex(tgt.placeholder));
   if (tgt.testId)      return page.getByTestId(tgt.testId);
-
-  // Direct selectors
   if (tgt.css)         return page.locator(tgt.css);
   if (tgt.xpath)       return page.locator(`xpath=${tgt.xpath}`);
-
   throw new Error('Unresolvable target: ' + JSON.stringify(t));
 }
 
-// Click with smart fallbacks on Playwright strict violations (multiple matches)
+// Wait a moment for navigation/DOM settle after clicks
+async function autoWaitAfterClick(page) {
+  // Try a short network idle; fall back to a small sleep
+  try { await page.waitForLoadState('networkidle', { timeout: 1500 }); }
+  catch { try { await page.waitForTimeout(500); } catch {} }
+}
+
+// Click with strict-mode fallbacks
 async function smartClick(page, t, timeout = 10000) {
   const tgt = normalizeTarget(t);
   try {
     const loc = await locatorFor(page, tgt);
     await loc.click({ timeout });
+    await autoWaitAfterClick(page);
     return;
   } catch (e) {
     const msg = String(e?.message || e);
     const patt = (tgt?.text || tgt?.name || tgt?.label);
-    // If multiple matches or strict violation, try role-based guesses, then first()
     if (/strict mode violation|resolved to \d+ elements/i.test(msg) && patt) {
-      const rex = asRegex(patt);
-      try { await page.getByRole('button', { name: rex }).first().click({ timeout }); return; } catch {}
-      try { await page.getByRole('link',   { name: rex }).first().click({ timeout }); return; } catch {}
+      const rx = asRegex(patt);
+      try { await page.getByRole('button', { name: rx }).first().click({ timeout }); await autoWaitAfterClick(page); return; } catch {}
+      try { await page.getByRole('link',   { name: rx }).first().click({ timeout }); await autoWaitAfterClick(page); return; } catch {}
       try {
         const loc2 = await locatorFor(page, tgt);
         await loc2.first().click({ timeout });
+        await autoWaitAfterClick(page);
         return;
       } catch {}
     }
@@ -81,24 +71,17 @@ async function smartClick(page, t, timeout = 10000) {
   }
 }
 
-// Select option accepting value/label/index and plain strings ("Option 2" or "2")
+// Select that accepts "2", "Option 2", {value}, {label}, {index}
 async function smartSelect(page, t, value, timeout = 10000) {
   const loc = await locatorFor(page, t);
   let opt = value;
   if (typeof opt === 'string') {
-    // Numeric-looking? treat as value; else treat as label
-    if (/^\d+$/.test(opt.trim())) {
-      // keep as string "2" (value)
-    } else {
-      opt = { label: opt }; // "Option 2" -> label
-    }
-  } else if (opt && typeof opt === 'object') {
-    // pass through {value|label|index}
+    if (/^\d+$/.test(opt.trim())) { /* looks like a value, keep "2" */ }
+    else { opt = { label: opt }; }  // "Option 2" -> label
   }
   await loc.selectOption(opt, { timeout });
 }
 
-// Join base and relative
 function joinUrl(base, rel) {
   if (!rel) return base || '/';
   if (rel.startsWith('http')) return rel;
@@ -107,16 +90,15 @@ function joinUrl(base, rel) {
   return b + r;
 }
 
+function hostOf(u) { try { return new URL(u).host; } catch { return ''; } }
+
 export async function runWebTests({ steps, baseUrl, runId, video = true, maxRunMs = 120000 }) {
-  const { chromium } = await import('playwright'); // lazy-load
+  const { chromium } = await import('playwright');
 
   const outDir = path.join(process.cwd(), 'runs', runId);
   await fsp.mkdir(outDir, { recursive: true });
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
   const context = await browser.newContext({
     ignoreHTTPSErrors: true,
     recordVideo: video ? { dir: outDir, size: { width: 1280, height: 720 } } : undefined
@@ -125,12 +107,18 @@ export async function runWebTests({ steps, baseUrl, runId, video = true, maxRunM
   page.setDefaultTimeout(15000);
   page.setDefaultNavigationTimeout(20000);
 
+  const baseHost = hostOf(baseUrl || '');
   const logLines = [];
   const log = m => { const line = `[${new Date().toISOString()}] ${m}`; logLines.push(line); console.log(line); };
-  page.on('console', msg => log(`console:${msg.type()}: ${msg.text()}`));
+
+  page.on('console',  msg => log(`console:${msg.type()}: ${msg.text()}`));
   page.on('pageerror', err => log(`pageerror: ${err?.message || err}`));
-  page.on('requestfailed', req => log(`requestfailed: ${req.method()} ${req.url()} -> ${req.failure()?.errorText}`));
   page.on('dialog', async d => { try { await d.dismiss(); } catch {} });
+  // Only log same-origin request failures to reduce noise from trackers/CDNs
+  page.on('requestfailed', req => {
+    const h = hostOf(req.url());
+    if (!baseHost || h === baseHost) log(`requestfailed: ${req.method()} ${req.url()} -> ${req.failure()?.errorText}`);
+  });
 
   const results = [];
   let passed = 0;
@@ -181,24 +169,20 @@ export async function runWebTests({ steps, baseUrl, runId, video = true, maxRunM
           }
           case 'check': {
             log(`STEP ${n}: check ${JSON.stringify(s.target)}`);
-            const loc = await locatorFor(page, s.target);
-            await loc.check({ timeout: 10000 });
+            await (await locatorFor(page, s.target)).check({ timeout: 10000 });
             break;
           }
           case 'uncheck': {
             log(`STEP ${n}: uncheck ${JSON.stringify(s.target)}`);
-            const loc = await locatorFor(page, s.target);
-            await loc.uncheck({ timeout: 10000 });
+            await (await locatorFor(page, s.target)).uncheck({ timeout: 10000 });
             break;
           }
           case 'waitForVisible': {
             log(`STEP ${n}: waitForVisible ${JSON.stringify(s.target)}`);
-            const loc = await locatorFor(page, s.target);
-            await loc.waitFor({ state: 'visible', timeout: 10000 });
+            await (await locatorFor(page, s.target)).waitFor({ state: 'visible', timeout: 10000 });
             break;
           }
           case 'assertText': {
-            // Accept: target string (page-level text) OR target locator + pattern/text
             const patt = s.pattern ?? s.text ?? (typeof s.target === 'string' ? s.target : null);
             if (!s.target || typeof s.target === 'string') {
               log(`STEP ${n}: assertText (page) ~ ${patt}`);
@@ -215,8 +199,7 @@ export async function runWebTests({ steps, baseUrl, runId, video = true, maxRunM
           case 'assertVisible': {
             const tgt = typeof s.target === 'string' ? { text: s.target } : s.target;
             log(`STEP ${n}: assertVisible ${JSON.stringify(tgt)}`);
-            const loc = await locatorFor(page, tgt);
-            await loc.waitFor({ state: 'visible', timeout: 10000 });
+            await (await locatorFor(page, tgt)).waitFor({ state: 'visible', timeout: 10000 });
             break;
           }
           case 'assertUrl': {
@@ -253,16 +236,13 @@ export async function runWebTests({ steps, baseUrl, runId, video = true, maxRunM
     }
   } finally {
     try { await fsp.writeFile(path.join(outDir, 'run.log'), logLines.join('\n')); } catch {}
-
-    let videoHandle = null;
-    if (video) {
-      try { videoHandle = (await context.pages())[0]?.video?.(); } catch {}
-    }
+    // Save video without hanging the response
+    let v = null; try { v = page.video && page.video(); } catch {}
     try { await context.close(); } catch {}
     try { await browser.close(); } catch {}
-    if (video && videoHandle) {
-      const save = (async () => { try { await videoHandle.saveAs(path.join(outDir, 'run.webm')); } catch {} })();
-      await Promise.race([save, new Promise(r => setTimeout(r, 3000))]); // don't block response forever
+    if (video && v) {
+      const p = (async () => { try { await v.saveAs(path.join(outDir, 'run.webm')); } catch {} })();
+      await Promise.race([p, new Promise(r => setTimeout(r, 3000))]);
     }
   }
 
