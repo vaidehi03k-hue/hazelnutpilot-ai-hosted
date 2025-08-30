@@ -44,7 +44,7 @@ export default function Dashboard() {
       // optional: refresh list
       setProjects(prev => [p, ...prev]);
       // redirect to the project page (your Project.jsx reads /project/<id> or ?id=)
-      window.location.href = `/project/${p.id}`;
+      window.location.href = `/project?id=${p.id}`;
     } catch (e) {
       setErr(String(e?.message || e));
     } finally {
