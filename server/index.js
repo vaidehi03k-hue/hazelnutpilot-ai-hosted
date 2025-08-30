@@ -5,7 +5,8 @@ import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import fs from 'fs';
 import multer from 'multer';
-import pdf from 'pdf-parse';
+// IMPORTANT: do NOT import 'pdf-parse' at top-level (it tries to read a demo file in some builds)
+// import pdf from 'pdf-parse';
 import mammoth from 'mammoth';
 import { runWebTests } from './runWebTests.js';
 import { generateTestsFromPrd } from './ai.js';
@@ -33,6 +34,21 @@ function saveDB(db) {
   fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
 
+// ---------- helpers ----------
+async function parsePdfBuffer(buf) {
+  // Prefer the library entry that doesn't include demo code.
+  let mod;
+  try {
+    mod = await import('pdf-parse/lib/pdf-parse.js');
+  } catch {
+    // fallback to main if needed (older versions)
+    mod = await import('pdf-parse');
+  }
+  const pdfParse = mod.default || mod;
+  const out = await pdfParse(buf);
+  return out?.text || '';
+}
+
 // ---------- app ----------
 const app = express();
 app.use(express.json({ limit: '4mb' }));
@@ -42,7 +58,7 @@ app.use('/api/projects/:id/upload-prd-text', express.text({ type: 'text/*', limi
 
 // CORS (Vercel UI -> Render API)
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // tighten to your Vercel origin if desired
+  res.setHeader('Access-Control-Allow-Origin', '*'); // tighten to your Vercel origin if you want
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
@@ -112,7 +128,6 @@ app.post('/api/projects/:id/base-url', (req, res) => {
 });
 
 // ---------- PRD Upload + AI Generation ----------
-// Accepts multipart file upload OR JSON with { prdText, baseUrl }
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.post('/api/projects/:id/upload-prd', upload.single('file'), async (req, res) => {
@@ -127,8 +142,7 @@ app.post('/api/projects/:id/upload-prd', upload.single('file'), async (req, res)
       const ext = (req.file.originalname || '').toLowerCase();
       try {
         if (ext.endsWith('.pdf')) {
-          const data = await pdf(req.file.buffer);
-          prdText = data.text || '';
+          prdText = (await parsePdfBuffer(req.file.buffer)) || '';
         } else if (ext.endsWith('.docx')) {
           const r = await mammoth.extractRawText({ buffer: req.file.buffer });
           prdText = r.value || '';
@@ -146,7 +160,7 @@ app.post('/api/projects/:id/upload-prd', upload.single('file'), async (req, res)
     // Base URL preference: request > existing project
     const baseUrl = req.body?.baseUrl || p.baseUrl || '';
 
-    // Generate steps with AI (strict, no local fallback)
+    // Generate steps with AI (strict; if AI errors, we bubble up)
     const steps = await generateTestsFromPrd({ baseUrl, prdText });
 
     // Persist PRD + steps
@@ -191,7 +205,7 @@ app.get('/api/projects/:id/steps', (req, res) => {
   res.json({ ok: true, steps: p.lastGeneratedSteps || [] });
 });
 
-// NEW: Import/overwrite steps (useful to quickly fix/try steps without re-generating)
+// Import/overwrite steps (manual quick fix without re-generating)
 app.post('/api/projects/:id/steps/import', (req, res) => {
   try {
     const db = loadDB();
@@ -214,7 +228,6 @@ app.post('/api/projects/:id/steps/import', (req, res) => {
 });
 
 // ---------- Run Web Tests ----------
-// Accepts { steps?, baseUrl? }. If steps missing, uses project's lastGeneratedSteps.
 app.post('/api/projects/:id/run-web', async (req, res) => {
   try {
     const db = loadDB();
@@ -260,7 +273,7 @@ app.post('/api/projects/:id/run-web', async (req, res) => {
   }
 });
 
-// List runs (for Run History table)
+// List runs
 app.get('/api/projects/:id/runs', (req, res) => {
   const db = loadDB();
   const p = db.projects.find(x => x.id === req.params.id);
